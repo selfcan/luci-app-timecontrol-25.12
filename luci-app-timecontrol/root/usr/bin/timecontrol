@@ -4,14 +4,14 @@
 # 适配 ImmortalWrt 25.12 (busybox ash)
 #
 # Copyright (C) 2022-2026 sirpdboy <herboy2008@gmail.com>
-# 修复版本：移除 iptables，支持黑白名单，增强连接清理，增加锁机制，支持手动重置
+# 修复版本：移除 iptables，支持黑白名单，增强连接清理，增加锁机制
+# 新增：手动重置、已用时长查询
 
 crrun=$1
 crid=$2
 NAME=timecontrol
-DEBUG=1          # [FIX] 建议改为从 UCI 读取，此处保留
+DEBUG=1
 
-# 锁文件防止并发
 LOCK_FILE="/var/lock/$NAME.fw.lock"
 
 config_t_get() {
@@ -23,21 +23,19 @@ config_t_get() {
 LOG_FILE="/var/log/timecontrol.log"
 IDLIST="/var/$NAME.idlist"
 
-# 时长数据库路径（多时段版本已定义）
+# 时长数据库路径
 DURATION_DIR="/var/lib/timecontrol"
 DURATION_DB="$DURATION_DIR/duration.db"
 PERIOD_DURATION_DB="$DURATION_DIR/period_duration.db"
 
-# [FIX] 仅使用 nftables，不再检测 iptables
 bin_nft=$(which nft 2>/dev/null)
 [ -x "$bin_nft" ] || {
     echo "错误: 未找到 nftables，请安装 nftables" >&2
     exit 1
 }
 
-# 获取配置
 chain=$(config_t_get timecontrol chain 0 "forward")
-list_type=$(config_t_get timecontrol list_type 0 "blacklist")   # blacklist 或 whitelist
+list_type=$(config_t_get timecontrol list_type 0 "blacklist")
 
 if [ "$chain" = "input" ]; then
     StrongCHAIN=1
@@ -59,12 +57,11 @@ info() {
     echo "FW-INFO: $@"
 }
 
-# ---------- 地址解析（不变） ----------
+# ---------- 地址解析 ----------
 parse_target() {
     local target="$1"
     target=$(echo "${target}" | xargs)
     
-    # IPv4单个地址
     if echo "$target" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
         local o1 o2 o3 o4
         IFS='.' read -r o1 o2 o3 o4 <<EOF
@@ -81,13 +78,11 @@ EOF
             echo "ipv4:single:$target"
             return 0
         }
-    # IPv4范围
     elif echo "$target" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}-([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
         local start_ip=${target%-*}
         local end_ip=${target#*-}
         echo "ipv4:range:$start_ip-$end_ip"
         return 0
-    # CIDR
     elif echo "$target" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$'; then
         local ip=${target%/*}
         local mask=${target#*/}
@@ -95,15 +90,12 @@ EOF
             echo "ipv4:cidr:$target"
             return 0
         }
-    # MAC地址
     elif echo "$target" | grep -qE '^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$'; then
         echo "mac:single:$(echo "$target" | tr '[:upper:]' '[:lower:]')"
         return 0
-    # IPv6地址
     elif echo "$target" | grep -qE '^([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}$'; then
         echo "ipv6:single:$target"
         return 0
-    # IPv6 CIDR
     elif echo "$target" | grep -qE '^([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}/[0-9]{1,3}$'; then
         local ipv6=${target%/*}
         local mask=${target#*/}
@@ -116,7 +108,7 @@ EOF
     return 1
 }
 
-# ---------- 连接清理（增强 IPv6） ----------
+# ---------- 连接清理 ----------
 flush_connections() {
     local target="$1"
     local bin_conntrack=$(which conntrack 2>/dev/null)
@@ -144,23 +136,18 @@ EOF
             $bin_conntrack -D -d "$value" 2>/dev/null && dbg "清理目标IPv4连接: $value"
             ;;
         "ipv6")
-            # [FIX] 添加 IPv6 清理，指定地址族
             $bin_conntrack -D -s "$value" -f ipv6 2>/dev/null && dbg "清理源IPv6连接: $value"
             $bin_conntrack -D -d "$value" -f ipv6 2>/dev/null && dbg "清理目标IPv6连接: $value"
             ;;
         "mac")
-            # MAC -> IP 转换（支持 IPv4 和 IPv6）
             local ip_list=""
-            # 从 ARP 获取 IPv4
             [ -f "/proc/net/arp" ] && {
                 ip_list="$ip_list $(grep -i "$value" /proc/net/arp 2>/dev/null | awk '{print $1}')"
             }
-            # 从邻居表获取 IPv6 (若存在)
             [ -f "/proc/net/ipv6_neigh" ] && {
                 ip_list="$ip_list $(grep -i "$value" /proc/net/ipv6_neigh 2>/dev/null | awk '{print $1}')"
             }
             for ip in $ip_list; do
-                # 判断 IPv4 还是 IPv6
                 if echo "$ip" | grep -q ':'; then
                     $bin_conntrack -D -s "$ip" -f ipv6 2>/dev/null && dbg "清理MAC对应IPv6连接: $ip"
                     $bin_conntrack -D -d "$ip" -f ipv6 2>/dev/null && dbg "清理MAC对应IPv6目标连接: $ip"
@@ -173,47 +160,38 @@ EOF
     esac
 }
 
-# ---------- 初始化防火墙（支持黑白名单） ----------
+# ---------- 初始化防火墙 ----------
 init_firewall() {
     info "初始化防火墙规则 (模式: $list_type, 强度: $chain)"
     
-    # 删除可能存在的旧表
     nft delete table inet timecontrol 2>/dev/null
     sleep 1
     
-    # 创建新表
     nft add table inet timecontrol
     
-    # 创建集合（始终存在）
     nft add set inet timecontrol blacklist "{ type ipv4_addr; flags interval; }"
     nft add set inet timecontrol blacklist6 "{ type ipv6_addr; flags interval; }"
     nft add set inet timecontrol blacklist_mac "{ type ether_addr; }"
-    # [FIX] 白名单集合（若需要）
     nft add set inet timecontrol whitelist "{ type ipv4_addr; flags interval; }"
     nft add set inet timecontrol whitelist6 "{ type ipv6_addr; flags interval; }"
     nft add set inet timecontrol whitelist_mac "{ type ether_addr; }"
     
-    # 创建 FORWARD 链，默认策略根据模式决定
     local policy="accept"
     [ "$list_type" = "whitelist" ] && policy="drop"
     nft add chain inet timecontrol forward "{ type filter hook forward priority -100; policy $policy; }"
     
-    # [FIX] 根据模式添加规则
     if [ "$list_type" = "blacklist" ]; then
-        # 黑名单：匹配集合则丢弃
         nft add rule inet timecontrol forward ip saddr @blacklist drop
         nft add rule inet timecontrol forward ip6 saddr @blacklist6 drop
         nft add rule inet timecontrol forward ether saddr @blacklist_mac drop
         dbg "黑名单模式规则已添加"
     else
-        # 白名单：匹配集合则接受，其余丢弃（策略已为 drop）
         nft add rule inet timecontrol forward ip saddr @whitelist accept
         nft add rule inet timecontrol forward ip6 saddr @whitelist6 accept
         nft add rule inet timecontrol forward ether saddr @whitelist_mac accept
         dbg "白名单模式规则已添加"
     fi
     
-    # 强控制模式（INPUT 链）
     if [ "$StrongCHAIN" -eq 1 ]; then
         nft add chain inet timecontrol input "{ type filter hook input priority -100; policy $policy; }"
         if [ "$list_type" = "blacklist" ]; then
@@ -239,7 +217,7 @@ stop_firewall() {
     rm -f "$IDLIST"
 }
 
-# ---------- 添加设备（根据模式添加至对应集合） ----------
+# ---------- 添加设备 ----------
 add_device() {
     local id="$1"
     local target=$(config_t_get device mac "$id")
@@ -263,7 +241,6 @@ $parsed_result
 EOF
     dbg "解析结果: type=$type, subtype=$subtype, value=$value"
     
-    # [FIX] 根据 list_type 决定添加到黑名单还是白名单集合
     local set_name
     if [ "$list_type" = "blacklist" ]; then
         set_name="blacklist"
@@ -286,17 +263,15 @@ EOF
             ;;
     esac
     
-    # 强控制模式清理连接
     if [ "$StrongCHAIN" -eq 1 ]; then
         dbg "强控制模式，清理现有连接"
         flush_connections "$target"
     fi
     
-    # [FIX] 改进验证：使用 nft get element 精确检查
     verify_firewall_rule "$target" "$set_name"
 }
 
-# ---------- 验证规则（精确） ----------
+# ---------- 验证规则 ----------
 verify_firewall_rule() {
     local target="$1"
     local set_name="$2"
@@ -305,7 +280,6 @@ verify_firewall_rule() {
     }
     dbg "验证防火墙规则: $target 在集合 $set_name 中"
     
-    # [FIX] 通过 nft get element 精确验证
     local parsed_result=$(parse_target "$target")
     [ $? -ne 0 ] && {
         dbg "无法解析，跳过验证"
@@ -378,10 +352,10 @@ EOF
     esac
 }
 
-# ===== [新增] 手动重置设备时长 =====
+# ===== 新增：手动重置设备时长 =====
 reset_device() {
     local id="$1"
-    local period="${2:-all}"   # 可选参数：1/2/3 或 all（默认all）
+    local period="${2:-all}"
     local target=$(config_t_get device mac "$id")
     [ -z "$target" ] && {
         echo "错误: 设备 ID $id 不存在"
@@ -389,29 +363,20 @@ reset_device() {
     }
     
     info "手动重置设备 $target 的时长 (时段: $period)"
-    
-    # 确保时长目录存在
     mkdir -p "$DURATION_DIR"
     
     if [ "$period" = "all" ]; then
-        # 重置所有时段（1-3）
         for p in 1 2 3; do
-            # 删除多时段记录
             sed -i "/^$target,$p,/d" "$PERIOD_DURATION_DB" 2>/dev/null
-            # 删除重置标记文件
             rm -f "$DURATION_DIR/last_reset_${target}_period${p}" 2>/dev/null
-            # 重新初始化为0（可选）
             echo "$target,$p,0,0,0" >> "$PERIOD_DURATION_DB"
             dbg "时段$p 已重置"
         done
-        # 清除原有单时段记录（虽然多时段模式不使用，但为了干净）
         sed -i "/^$target,/d" "$DURATION_DB" 2>/dev/null
         rm -f "$DURATION_DIR/last_reset_$target" 2>/dev/null
         info "所有时段已重置"
     else
-        # 检查时段号是否合法
         if [ "$period" -ge 1 ] && [ "$period" -le 3 ]; then
-            # 删除指定时段记录
             sed -i "/^$target,$period,/d" "$PERIOD_DURATION_DB" 2>/dev/null
             rm -f "$DURATION_DIR/last_reset_${target}_period${period}" 2>/dev/null
             echo "$target,$period,0,0,0" >> "$PERIOD_DURATION_DB"
@@ -422,9 +387,44 @@ reset_device() {
         fi
     fi
     
-    # 提示用户：将在下一分钟生效
     echo "重置成功，时间控制将在下一分钟生效"
     return 0
+}
+
+# ===== 新增：获取设备已用时长 =====
+get_device_usage() {
+    local id="$1"
+    local period="$2"
+    local target=$(config_t_get device mac "$id")
+    [ -z "$target" ] && { echo "0"; return 1; }
+    
+    local now=$(date +%s)
+    if [ "$period" != "all" ]; then
+        local used=0
+        if grep -q "^$target,$period," "$PERIOD_DURATION_DB" 2>/dev/null; then
+            local line=$(grep "^$target,$period," "$PERIOD_DURATION_DB" 2>/dev/null)
+            local last_connect=$(echo "$line" | cut -d',' -f3)
+            local total_used=$(echo "$line" | cut -d',' -f4)
+            used=$total_used
+            [ "$last_connect" -gt 0 ] && used=$((used + now - last_connect))
+        fi
+        echo "$((used / 60))"
+    else
+        local values=""
+        for p in 1 2 3; do
+            local used=0
+            if grep -q "^$target,$p," "$PERIOD_DURATION_DB" 2>/dev/null; then
+                local line=$(grep "^$target,$p," "$PERIOD_DURATION_DB" 2>/dev/null)
+                local last_connect=$(echo "$line" | cut -d',' -f3)
+                local total_used=$(echo "$line" | cut -d',' -f4)
+                used=$total_used
+                [ "$last_connect" -gt 0 ] && used=$((used + now - last_connect))
+            fi
+            values="${values}${p}:$((used / 60))"
+            [ "$p" -lt 3 ] && values="${values},"
+        done
+        echo "$values"
+    fi
 }
 
 # ---------- 显示状态 ----------
@@ -438,20 +438,17 @@ show_firewall_status() {
     nft list table inet timecontrol 2>/dev/null || echo "  未找到timecontrol表"
 }
 
-# ---------- 诊断（进程名统一为 timecontrol） ----------
+# ---------- 诊断 ----------
 diagnose() {
     echo ""
     echo "=== 时间控制系统诊断 ==="
     echo ""
-    
-    # [FIX] 进程名改为 timecontrol（与 init 脚本一致）
     echo "1. 服务状态:"
     if ps | grep -q "timecontrol"; then
         echo "   ✓ timecontrol 正在运行"
     else
         echo "   ✗ timecontrol 未运行"
     fi
-    
     echo ""
     echo "2. 配置文件:"
     if [ -f "/etc/config/timecontrol" ]; then
@@ -462,7 +459,6 @@ diagnose() {
     else
         echo "   ✗ 配置文件不存在"
     fi
-    
     echo ""
     echo "3. 防火墙工具:"
     if [ -x "$bin_nft" ]; then
@@ -471,9 +467,7 @@ diagnose() {
     else
         echo "   ✗ 未找到 nftables"
     fi
-    
     show_firewall_status
-    
     echo ""
     echo "4. 当前控制列表:"
     if [ -f "$IDLIST" ] && [ -s "$IDLIST" ]; then
@@ -490,8 +484,7 @@ diagnose() {
     echo "=== 诊断完成 ==="
 }
 
-# ---------- 主命令处理（加锁） ----------
-# [FIX] 添加锁机制防止并发
+# ---------- 主命令处理 ----------
 exec 200>"$LOCK_FILE"
 flock -n 200 || {
     echo "另一个实例正在运行，退出"
@@ -515,7 +508,7 @@ case "$crrun" in
         stop_firewall
         info "时间控制已停止"
         ;;
-    "restart"|"reload")   # [FIX] 增加 reload
+    "restart"|"reload")
         info "重启时间控制"
         stop_firewall
         init_firewall
@@ -533,7 +526,6 @@ case "$crrun" in
         }
         info "添加设备控制: ID=$crid"
         add_device "$crid"
-        # [FIX] 更新 IDLIST
         if ! grep -q "!$crid!" "$IDLIST" 2>/dev/null; then
             echo "!$crid!" >> "$IDLIST"
         fi
@@ -549,14 +541,21 @@ case "$crrun" in
         sed -i "/!$crid!/d" "$IDLIST" 2>/dev/null
         show_firewall_status
         ;;
-    # ===== [新增] 重置命令 =====
-    "reset")
+    "reset")   # 新增重置命令
         [ -z "$crid" ] && {
             echo "错误: 需要指定设备ID"
             exit 1
         }
-        local period="${3:-all}"   # 可选第三参数：1/2/3 或 all
+        local period="${3:-all}"
         reset_device "$crid" "$period"
+        ;;
+    "getusage")   # 新增查询已用时长
+        [ -z "$crid" ] && {
+            echo "错误: 需要指定设备ID"
+            exit 1
+        }
+        local period="${3:-all}"
+        get_device_usage "$crid" "$period"
         ;;
     "status")
         show_firewall_status
@@ -590,7 +589,7 @@ case "$crrun" in
     "help"|"")
         echo "时间控制系统命令工具"
         echo ""
-        echo "用法: $0 {start|stop|restart|add <id>|del <id>|reset <id> [period]|status|diagnose|test|flush|help}"
+        echo "用法: $0 {start|stop|restart|add <id>|del <id>|reset <id> [period]|getusage <id> [period]|status|diagnose|test|flush|help}"
         echo ""
         echo "命令说明:"
         echo "  start           - 初始化防火墙规则"
@@ -599,6 +598,7 @@ case "$crrun" in
         echo "  add <id>        - 添加设备到控制列表"
         echo "  del <id>        - 从控制列表移除设备"
         echo "  reset <id> [period] - 重置设备时长 (period=1-3 或 all, 默认all)"
+        echo "  getusage <id> [period] - 查询设备已用时长 (period=1-3 或 all, 默认all)"
         echo "  status          - 显示防火墙状态"
         echo "  diagnose        - 系统诊断"
         echo "  test            - 测试地址解析"
@@ -612,5 +612,4 @@ case "$crrun" in
         ;;
 esac
 
-# 解锁
 flock -u 200
