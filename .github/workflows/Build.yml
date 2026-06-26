@@ -69,10 +69,20 @@ jobs:
         run: |
           cd ${{ env.SDK_DIR }}
           make defconfig
+          # 禁用不必要的 libnetfilter 包（它们导致编译失败）
+          sed -i '/^CONFIG_PACKAGE_libnetfilter-/d' .config
+          echo "CONFIG_PACKAGE_libnetfilter-cttimeout=n" >> .config
+          echo "CONFIG_PACKAGE_libnetfilter-cthelper=n" >> .config
+          echo "CONFIG_PACKAGE_libnetfilter-queue=n" >> .config
+          # 确保插件被正确启用，APK 格式开启
           sed -i '/^CONFIG_USE_APK/d' .config
           sed -i "/^CONFIG_PACKAGE_${{ github.event.inputs.PLUGIN_NAME }}=/d" .config
           echo "CONFIG_USE_APK=y" >> .config
           echo "CONFIG_PACKAGE_${{ github.event.inputs.PLUGIN_NAME }}=m" >> .config
+
+          # 使用 olddefconfig 自动处理新增选项，无交互
+          make olddefconfig
+
 
       # 下载依赖 + 编译插件
       - name: Build Plugin Only
