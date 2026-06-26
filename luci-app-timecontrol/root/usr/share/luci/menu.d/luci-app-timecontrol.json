@@ -5,18 +5,18 @@
     "action": {
       "type": "firstchild"
     },
-    "acl": [ "read" ], 
     "depends": {
-      "acl": [ "luci-app-timecontrol" ]
+      "uci": { "config": "timecontrol" }
     },
+    "acl": [ "read" ],
     "recurse": true
   },
   "admin/services/timecontrol/basic": {
-		"title": "Time Control",
-		"order": 10,
-		"action": {
-			"type": "view",
-			"path": "timecontrol/basic"
+    "title": "Time Control",
+    "order": 10,
+    "action": {
+      "type": "view",
+      "path": "timecontrol/basic"
     },
     "acl": [ "read" ]
   },
