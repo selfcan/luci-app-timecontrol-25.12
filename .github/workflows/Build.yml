@@ -68,7 +68,9 @@ jobs:
       - name: Build Plugin Only
         run: |
           cd ${{ env.SDK_DIR }}
-          make -j$(nproc) package/${{ github.event.inputs.PLUGIN_NAME }}/prepare download compile V=w
+          make -j$(nproc) package/${{ github.event.inputs.PLUGIN_NAME }}/download
+          # 编译插件，仅输出关键日志减少IO
+          make -j$(nproc) package/${{ github.event.inputs.PLUGIN_NAME }}/compile V=w
 
       # 打包产物
       - name: Archive Output
