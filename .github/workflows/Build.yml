@@ -52,7 +52,8 @@ jobs:
           # 把仓库内所有文件移动到正确package目录，无嵌套
           mkdir -p package/$PLG
           ls tmp_plg
-          mv tmp_plg/* package/$PLG/
+          mv tmp_plg/$PLG/* package/$PLG/
+          ls package/$PLG
           rm -rf tmp_plg
 
       # 极简feed更新，只拉luci/packages
