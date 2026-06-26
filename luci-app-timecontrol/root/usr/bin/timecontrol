@@ -4,7 +4,7 @@
 # 适配 ImmortalWrt 25.12 (busybox ash)
 #
 # Copyright (C) 2022-2026 sirpdboy <herboy2008@gmail.com>
-# 修复版本：移除 iptables，支持黑白名单，增强连接清理，增加锁机制
+# 修复版本：移除 iptables，支持黑白名单，增强连接清理，增加锁机制，支持手动重置
 
 crrun=$1
 crid=$2
@@ -22,6 +22,11 @@ config_t_get() {
 
 LOG_FILE="/var/log/timecontrol.log"
 IDLIST="/var/$NAME.idlist"
+
+# 时长数据库路径（多时段版本已定义）
+DURATION_DIR="/var/lib/timecontrol"
+DURATION_DB="$DURATION_DIR/duration.db"
+PERIOD_DURATION_DB="$DURATION_DIR/period_duration.db"
 
 # [FIX] 仅使用 nftables，不再检测 iptables
 bin_nft=$(which nft 2>/dev/null)
@@ -373,6 +378,55 @@ EOF
     esac
 }
 
+# ===== [新增] 手动重置设备时长 =====
+reset_device() {
+    local id="$1"
+    local period="${2:-all}"   # 可选参数：1/2/3 或 all（默认all）
+    local target=$(config_t_get device mac "$id")
+    [ -z "$target" ] && {
+        echo "错误: 设备 ID $id 不存在"
+        return 1
+    }
+    
+    info "手动重置设备 $target 的时长 (时段: $period)"
+    
+    # 确保时长目录存在
+    mkdir -p "$DURATION_DIR"
+    
+    if [ "$period" = "all" ]; then
+        # 重置所有时段（1-3）
+        for p in 1 2 3; do
+            # 删除多时段记录
+            sed -i "/^$target,$p,/d" "$PERIOD_DURATION_DB" 2>/dev/null
+            # 删除重置标记文件
+            rm -f "$DURATION_DIR/last_reset_${target}_period${p}" 2>/dev/null
+            # 重新初始化为0（可选）
+            echo "$target,$p,0,0,0" >> "$PERIOD_DURATION_DB"
+            dbg "时段$p 已重置"
+        done
+        # 清除原有单时段记录（虽然多时段模式不使用，但为了干净）
+        sed -i "/^$target,/d" "$DURATION_DB" 2>/dev/null
+        rm -f "$DURATION_DIR/last_reset_$target" 2>/dev/null
+        info "所有时段已重置"
+    else
+        # 检查时段号是否合法
+        if [ "$period" -ge 1 ] && [ "$period" -le 3 ]; then
+            # 删除指定时段记录
+            sed -i "/^$target,$period,/d" "$PERIOD_DURATION_DB" 2>/dev/null
+            rm -f "$DURATION_DIR/last_reset_${target}_period${period}" 2>/dev/null
+            echo "$target,$period,0,0,0" >> "$PERIOD_DURATION_DB"
+            info "时段$period 已重置"
+        else
+            echo "错误: 时段号必须为1-3或all"
+            return 1
+        fi
+    fi
+    
+    # 提示用户：将在下一分钟生效
+    echo "重置成功，时间控制将在下一分钟生效"
+    return 0
+}
+
 # ---------- 显示状态 ----------
 show_firewall_status() {
     echo ""
@@ -495,6 +549,15 @@ case "$crrun" in
         sed -i "/!$crid!/d" "$IDLIST" 2>/dev/null
         show_firewall_status
         ;;
+    # ===== [新增] 重置命令 =====
+    "reset")
+        [ -z "$crid" ] && {
+            echo "错误: 需要指定设备ID"
+            exit 1
+        }
+        local period="${3:-all}"   # 可选第三参数：1/2/3 或 all
+        reset_device "$crid" "$period"
+        ;;
     "status")
         show_firewall_status
         ;;
@@ -527,7 +590,7 @@ case "$crrun" in
     "help"|"")
         echo "时间控制系统命令工具"
         echo ""
-        echo "用法: $0 {start|stop|restart|add <id>|del <id>|status|diagnose|test|flush|help}"
+        echo "用法: $0 {start|stop|restart|add <id>|del <id>|reset <id> [period]|status|diagnose|test|flush|help}"
         echo ""
         echo "命令说明:"
         echo "  start           - 初始化防火墙规则"
@@ -535,6 +598,7 @@ case "$crrun" in
         echo "  restart/reload  - 重启防火墙"
         echo "  add <id>        - 添加设备到控制列表"
         echo "  del <id>        - 从控制列表移除设备"
+        echo "  reset <id> [period] - 重置设备时长 (period=1-3 或 all, 默认all)"
         echo "  status          - 显示防火墙状态"
         echo "  diagnose        - 系统诊断"
         echo "  test            - 测试地址解析"
