@@ -25,7 +25,7 @@ jobs:
 
       # 缓存SDK本体 + dl下载目录（必须设置 id）
       - name: Cache SDK & DL
-        id: sdk-cache   # <--- 添加 id
+        id: sdk-cache
         uses: actions/cache@v4
         with:
           path: |
@@ -35,14 +35,14 @@ jobs:
 
       # 缓存未命中才下载SDK
       - name: Get SDK
-        if: steps.sdk-cache.outputs.cache-hit != 'true'   # <--- 正确引用
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
         run: |
           wget -c -q ${{ env.SDK_URL }} -O sdk.tar.zst
           mkdir -p ${{ env.SDK_DIR }}
           tar -xf sdk.tar.zst -C ${{ env.SDK_DIR }} --strip-components=1
           rm -f sdk.tar.zst
 
-      # 直接克隆插件到 package 目录（修正）
+      # 克隆插件（修正：处理子目录结构）
       - name: Clone Plugin
         run: |
           cd ${{ env.SDK_DIR }}
@@ -50,50 +50,71 @@ jobs:
           # 1. 克隆到临时目录
           git clone --depth 1 --branch ${{ github.event.inputs.PLUGIN_BRANCH }} \
             ${{ github.event.inputs.PLUGIN_REPO }} tmp_plg
-          # 2. 将插件子目录的内容移动到 package/$PLG
-          #    注意：源路径是 tmp_plg/luci-app-timecontrol/*，目标路径是 package/$PLG/
+          # 2. 将插件子目录（与PLUGIN_NAME同名）的内容移动到 package/$PLG
+          #    注意：仓库根目录下是 luci-app-timecontrol 文件夹，其内容才是插件源码
           mkdir -p package/$PLG
-          mv tmp_plg/luci-app-timecontrol/* package/$PLG/
+          mv tmp_plg/$PLG/* package/$PLG/
           # 3. 清理临时目录
           rm -rf tmp_plg
 
-      # 更新feeds并安装所有依赖（修正）
+      # 更新feeds并安装所有依赖
       - name: Update & Install Feeds
         run: |
           cd ${{ env.SDK_DIR }}
           ./scripts/feeds update packages luci
-          ./scripts/feeds install -a   # <--- 增加 install
+          ./scripts/feeds install -a   # 安装所有依赖，确保插件依赖可用
 
-      # 生成极简配置
+      # 生成极简配置（重点优化：删除有问题的包并强制禁用）
       - name: Gen Min Config
         run: |
           cd ${{ env.SDK_DIR }}
+
+          # ---- 删除已知有问题的包源码目录，避免被编译系统加载 ----
+          # libnetfilter 系列存在编译错误，且插件不依赖它们
+          rm -rf feeds/packages/libs/libnetfilter-*
+          # luci-app-diskman 存在递归依赖，插件不依赖它
+          rm -rf feeds/luci/applications/luci-app-diskman
+
+          # 生成默认配置
           make defconfig
+
+          # ---- 强制禁用这些包（多重保险） ----
+          for pkg in libnetfilter-cttimeout libnetfilter-cthelper libnetfilter-queue luci-app-diskman; do
+            sed -i "/^CONFIG_PACKAGE_${pkg}/d" .config
+            echo "CONFIG_PACKAGE_${pkg}=n" >> .config
+          done
+
+          # 启用 APK 格式和我们的插件
           sed -i '/^CONFIG_USE_APK/d' .config
           sed -i "/^CONFIG_PACKAGE_${{ github.event.inputs.PLUGIN_NAME }}=/d" .config
           echo "CONFIG_USE_APK=y" >> .config
           echo "CONFIG_PACKAGE_${{ github.event.inputs.PLUGIN_NAME }}=m" >> .config
-          
 
+          # 自动处理新配置选项
+          make olddefconfig
+
+          # ---- 再次强制禁用（防止 olddefconfig 重新启用） ----
+          for pkg in libnetfilter-cttimeout libnetfilter-cthelper libnetfilter-queue luci-app-diskman; do
+            sed -i "/^CONFIG_PACKAGE_${pkg}/d" .config
+            echo "CONFIG_PACKAGE_${pkg}=n" >> .config
+          done
+          make olddefconfig
 
       # 下载依赖 + 编译插件
       - name: Build Plugin Only
         run: |
           cd ${{ env.SDK_DIR }}
+          # 只下载插件依赖（使用多线程加速）
           make -j$(nproc) package/${{ github.event.inputs.PLUGIN_NAME }}/download
-          # 若编译失败可改为 V=s 调试
-          #make -j$(nproc) package/${{ github.event.inputs.PLUGIN_NAME }}/compile V=s
+          # 单线程编译，便于排错；保留 V=s 输出完整日志
           make -j1 package/${{ github.event.inputs.PLUGIN_NAME }}/compile V=s
 
-      # 打包产物（修正：使用 find 或打包整个目录）
+      # 打包产物（打包整个 BIN 目录，简单可靠）
       - name: Archive Output
         run: |
           BIN=${{ env.SDK_DIR }}/bin/packages/${{ env.ARCH }}
           TAR=${{ env.ARCH }}_${{ github.event.inputs.PLUGIN_NAME }}.tar.gz
-          # 方式一：打包整个 BIN 目录（最简单）
           tar -zcvf $TAR -C $BIN .
-          # 或方式二：只包含插件相关文件（递归查找）
-          # find $BIN -type f \( -name "${{ github.event.inputs.PLUGIN_NAME }}*.apk" -o -name "${{ github.event.inputs.PLUGIN_NAME }}*.ipk" \) -exec tar -rvf $TAR -C $BIN {} + 2>/dev/null
           echo "TAR=$TAR" >> $GITHUB_ENV
 
       - name: Upload Artifact
