@@ -1,17 +1,18 @@
 #!/bin/sh
-
-# Copyright (C) 2006 OpenWrt.org
-# Copyright 2022-2026 sirpdboy <herboy2008@gmail.com>
 #
-# 适配 ImmortalWrt 25.12 (busybox ash) 修改：
-# 1. Shebang 改为 #!/bin/sh
-# 2. 移除 Bash 数组，改用 IFS read 拆分
-# 3. 所有 <<< 替换为 here-doc
+# 时间控制防火墙管理脚本（仅 nftables）
+# 适配 ImmortalWrt 25.12 (busybox ash)
+#
+# Copyright (C) 2022-2026 sirpdboy <herboy2008@gmail.com>
+# 修复版本：移除 iptables，支持黑白名单，增强连接清理，增加锁机制
 
 crrun=$1
 crid=$2
 NAME=timecontrol
-DEBUG=1  # 开启调试
+DEBUG=1          # [FIX] 建议改为从 UCI 读取，此处保留
+
+# 锁文件防止并发
+LOCK_FILE="/var/lock/$NAME.fw.lock"
 
 config_t_get() {
     local index=${3:-0}
@@ -22,17 +23,16 @@ config_t_get() {
 LOG_FILE="/var/log/timecontrol.log"
 IDLIST="/var/$NAME.idlist"
 
+# [FIX] 仅使用 nftables，不再检测 iptables
 bin_nft=$(which nft 2>/dev/null)
-bin_iptables=$(which iptables 2>/dev/null)
-bin_ip6tables=$(which ip6tables 2>/dev/null)
-bin_conntrack=$(which conntrack 2>/dev/null)
-
-nftables_ver=0
-iptables_ver=0
+[ -x "$bin_nft" ] || {
+    echo "错误: 未找到 nftables，请安装 nftables" >&2
+    exit 1
+}
 
 # 获取配置
 chain=$(config_t_get timecontrol chain 0 "forward")
-list_type=$(config_t_get timecontrol list_type 0 "blacklist")
+list_type=$(config_t_get timecontrol list_type 0 "blacklist")   # blacklist 或 whitelist
 
 if [ "$chain" = "input" ]; then
     StrongCHAIN=1
@@ -54,14 +54,10 @@ info() {
     echo "FW-INFO: $@"
 }
 
-# 地址解析函数 - 修复格式问题（无 Bash 数组）
+# ---------- 地址解析（不变） ----------
 parse_target() {
     local target="$1"
-    
-    # 去除空格
     target=$(echo "${target}" | xargs)
-    
-    # dbg "解析目标地址: $target"
     
     # IPv4单个地址
     if echo "$target" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
@@ -80,14 +76,12 @@ EOF
             echo "ipv4:single:$target"
             return 0
         }
-    
     # IPv4范围
     elif echo "$target" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}-([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
         local start_ip=${target%-*}
         local end_ip=${target#*-}
         echo "ipv4:range:$start_ip-$end_ip"
         return 0
-    
     # CIDR
     elif echo "$target" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$'; then
         local ip=${target%/*}
@@ -96,17 +90,14 @@ EOF
             echo "ipv4:cidr:$target"
             return 0
         }
-    
     # MAC地址
     elif echo "$target" | grep -qE '^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$'; then
         echo "mac:single:$(echo "$target" | tr '[:upper:]' '[:lower:]')"
         return 0
-    
     # IPv6地址
     elif echo "$target" | grep -qE '^([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}$'; then
         echo "ipv6:single:$target"
         return 0
-    
     # IPv6 CIDR
     elif echo "$target" | grep -qE '^([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}/[0-9]{1,3}$'; then
         local ipv6=${target%/*}
@@ -116,15 +107,14 @@ EOF
             return 0
         }
     fi
-    
     dbg "无法解析地址: $target"
     return 1
 }
 
-# 清理现有连接
+# ---------- 连接清理（增强 IPv6） ----------
 flush_connections() {
     local target="$1"
-    
+    local bin_conntrack=$(which conntrack 2>/dev/null)
     [ -x "$bin_conntrack" ] || {
         dbg "conntrack不可用"
         return
@@ -136,7 +126,6 @@ flush_connections() {
         return
     }
     
-    # 使用 here-doc 解析
     local type subtype value
     IFS=':' read -r type subtype value <<EOF
 $parsed_result
@@ -146,145 +135,106 @@ EOF
     
     case "$type" in
         "ipv4")
-            $bin_conntrack -D -s "$value" 2>/dev/null && dbg "清理源连接: $value"
-            $bin_conntrack -D -d "$value" 2>/dev/null && dbg "清理目标连接: $value"
+            $bin_conntrack -D -s "$value" 2>/dev/null && dbg "清理源IPv4连接: $value"
+            $bin_conntrack -D -d "$value" 2>/dev/null && dbg "清理目标IPv4连接: $value"
+            ;;
+        "ipv6")
+            # [FIX] 添加 IPv6 清理，指定地址族
+            $bin_conntrack -D -s "$value" -f ipv6 2>/dev/null && dbg "清理源IPv6连接: $value"
+            $bin_conntrack -D -d "$value" -f ipv6 2>/dev/null && dbg "清理目标IPv6连接: $value"
             ;;
         "mac")
-            # MAC地址需要先转换为IP
-            if [ -f "/proc/net/arp" ]; then
-                local ip_addr=$(grep -i "$value" /proc/net/arp 2>/dev/null | awk '{print $1}' | head -1)
-                if [ -n "$ip_addr" ]; then
-                    $bin_conntrack -D -s "$ip_addr" 2>/dev/null && dbg "清理MAC源连接: $value -> $ip_addr"
-                    $bin_conntrack -D -d "$ip_addr" 2>/dev/null && dbg "清理MAC目标连接: $value -> $ip_addr"
+            # MAC -> IP 转换（支持 IPv4 和 IPv6）
+            local ip_list=""
+            # 从 ARP 获取 IPv4
+            [ -f "/proc/net/arp" ] && {
+                ip_list="$ip_list $(grep -i "$value" /proc/net/arp 2>/dev/null | awk '{print $1}')"
+            }
+            # 从邻居表获取 IPv6 (若存在)
+            [ -f "/proc/net/ipv6_neigh" ] && {
+                ip_list="$ip_list $(grep -i "$value" /proc/net/ipv6_neigh 2>/dev/null | awk '{print $1}')"
+            }
+            for ip in $ip_list; do
+                # 判断 IPv4 还是 IPv6
+                if echo "$ip" | grep -q ':'; then
+                    $bin_conntrack -D -s "$ip" -f ipv6 2>/dev/null && dbg "清理MAC对应IPv6连接: $ip"
+                    $bin_conntrack -D -d "$ip" -f ipv6 2>/dev/null && dbg "清理MAC对应IPv6目标连接: $ip"
+                else
+                    $bin_conntrack -D -s "$ip" 2>/dev/null && dbg "清理MAC对应IPv4连接: $ip"
+                    $bin_conntrack -D -d "$ip" 2>/dev/null && dbg "清理MAC对应IPv4目标连接: $ip"
                 fi
-            fi
+            done
             ;;
     esac
 }
 
-# 检查防火墙工具
-check_firewall_tool() {
-    if [ -x "$bin_nft" ]; then
-        nftables_ver=1
-        dbg "检测到nftables: $bin_nft"
-    elif [ -x "$bin_iptables" ] && [ -x "$bin_ip6tables" ]; then
-        iptables_ver=1
-        dbg "检测到iptables: $bin_iptables, $bin_ip6tables"
-    else
-        info "错误: 未找到可用的防火墙工具"
-        return 1
-    fi
-    return 0
-}
-
-# 初始化防火墙
+# ---------- 初始化防火墙（支持黑白名单） ----------
 init_firewall() {
-    check_firewall_tool || return 1
-    
     info "初始化防火墙规则 (模式: $list_type, 强度: $chain)"
     
-    if [ -n "$nftables_ver" ]; then
-        # 使用nftables
-        dbg "初始化nftables"
-        
-        # 删除可能存在的旧表
-        nft delete table inet timecontrol 2>/dev/null
-        sleep 1
-        
-        # 创建新表
-        nft add table inet timecontrol
-        nft add chain inet timecontrol forward "{ type filter hook forward priority -100; policy accept; }"
-        
-        # 创建黑名单集合
-        nft add set inet timecontrol blacklist "{ type ipv4_addr; flags interval; }"
-        nft add set inet timecontrol blacklist6 "{ type ipv6_addr; flags interval; }"
-        nft add set inet timecontrol blacklist_mac "{ type ether_addr; }"
-        
-        # 添加规则（黑名单模式：匹配到就DROP）
+    # 删除可能存在的旧表
+    nft delete table inet timecontrol 2>/dev/null
+    sleep 1
+    
+    # 创建新表
+    nft add table inet timecontrol
+    
+    # 创建集合（始终存在）
+    nft add set inet timecontrol blacklist "{ type ipv4_addr; flags interval; }"
+    nft add set inet timecontrol blacklist6 "{ type ipv6_addr; flags interval; }"
+    nft add set inet timecontrol blacklist_mac "{ type ether_addr; }"
+    # [FIX] 白名单集合（若需要）
+    nft add set inet timecontrol whitelist "{ type ipv4_addr; flags interval; }"
+    nft add set inet timecontrol whitelist6 "{ type ipv6_addr; flags interval; }"
+    nft add set inet timecontrol whitelist_mac "{ type ether_addr; }"
+    
+    # 创建 FORWARD 链，默认策略根据模式决定
+    local policy="accept"
+    [ "$list_type" = "whitelist" ] && policy="drop"
+    nft add chain inet timecontrol forward "{ type filter hook forward priority -100; policy $policy; }"
+    
+    # [FIX] 根据模式添加规则
+    if [ "$list_type" = "blacklist" ]; then
+        # 黑名单：匹配集合则丢弃
         nft add rule inet timecontrol forward ip saddr @blacklist drop
         nft add rule inet timecontrol forward ip6 saddr @blacklist6 drop
         nft add rule inet timecontrol forward ether saddr @blacklist_mac drop
-        
-        # 强控制模式
-        if [ "$StrongCHAIN" -eq 1 ]; then
-            nft add chain inet timecontrol input "{ type filter hook input priority -100; policy accept; }"
+        dbg "黑名单模式规则已添加"
+    else
+        # 白名单：匹配集合则接受，其余丢弃（策略已为 drop）
+        nft add rule inet timecontrol forward ip saddr @whitelist accept
+        nft add rule inet timecontrol forward ip6 saddr @whitelist6 accept
+        nft add rule inet timecontrol forward ether saddr @whitelist_mac accept
+        dbg "白名单模式规则已添加"
+    fi
+    
+    # 强控制模式（INPUT 链）
+    if [ "$StrongCHAIN" -eq 1 ]; then
+        nft add chain inet timecontrol input "{ type filter hook input priority -100; policy $policy; }"
+        if [ "$list_type" = "blacklist" ]; then
             nft add rule inet timecontrol input ip saddr @blacklist drop
             nft add rule inet timecontrol input ip6 saddr @blacklist6 drop
             nft add rule inet timecontrol input ether saddr @blacklist_mac drop
-            dbg "已启用强控制模式 (INPUT链)"
+        else
+            nft add rule inet timecontrol input ip saddr @whitelist accept
+            nft add rule inet timecontrol input ip6 saddr @whitelist6 accept
+            nft add rule inet timecontrol input ether saddr @whitelist_mac accept
         fi
-        
-        info "nftables初始化完成"
-        
-    elif [ -n "$iptables_ver" ]; then
-        # 使用iptables
-        dbg "初始化iptables"
-        
-        # 创建ipset（如果不存在）
-        ipset create timecontrol_blacklist hash:net 2>/dev/null || {
-            ipset flush timecontrol_blacklist
-            dbg "已存在的ipset timecontrol_blacklist已清空"
-        }
-        
-        ipset create timecontrol_blacklist6 hash:net family inet6 2>/dev/null || {
-            ipset flush timecontrol_blacklist6
-            dbg "已存在的ipset timecontrol_blacklist6已清空"
-        }
-        
-        # 删除可能存在的旧规则
-        iptables -D FORWARD -m set --match-set timecontrol_blacklist src -j DROP 2>/dev/null
-        ip6tables -D FORWARD -m set --match-set timecontrol_blacklist6 src -j DROP 2>/dev/null
-        
-        # 添加新规则（黑名单模式）
-        iptables -I FORWARD -m set --match-set timecontrol_blacklist src -j DROP
-        ip6tables -I FORWARD -m set --match-set timecontrol_blacklist6 src -j DROP
-        
-        dbg "已添加FORWARD规则"
-        
-        # 强控制模式
-        if [ "$StrongCHAIN" -eq 1 ]; then
-            iptables -D INPUT -m set --match-set timecontrol_blacklist src -j DROP 2>/dev/null
-            ip6tables -D INPUT -m set --match-set timecontrol_blacklist6 src -j DROP 2>/dev/null
-            
-            iptables -I INPUT -m set --match-set timecontrol_blacklist src -j DROP
-            ip6tables -I INPUT -m set --match-set timecontrol_blacklist6 src -j DROP
-            
-            dbg "已启用强控制模式 (INPUT链)"
-        fi
-        
-        info "iptables初始化完成"
+        dbg "已启用强控制模式 (INPUT链)"
     fi
     
+    info "nftables初始化完成"
     return 0
 }
 
-# 停止防火墙规则
+# ---------- 停止防火墙 ----------
 stop_firewall() {
     info "停止防火墙规则"
-    
-    if [ -n "$nftables_ver" ]; then
-        nft delete table inet timecontrol 2>/dev/null && info "nftables规则已删除"
-    fi
-    
-    if [ -n "$iptables_ver" ]; then
-        # 删除iptables规则
-        iptables -D FORWARD -m set --match-set timecontrol_blacklist src -j DROP 2>/dev/null
-        iptables -D INPUT -m set --match-set timecontrol_blacklist src -j DROP 2>/dev/null
-        ip6tables -D FORWARD -m set --match-set timecontrol_blacklist6 src -j DROP 2>/dev/null
-        ip6tables -D INPUT -m set --match-set timecontrol_blacklist6 src -j DROP 2>/dev/null
-        
-        # 删除ipset
-        ipset destroy timecontrol_blacklist 2>/dev/null
-        ipset destroy timecontrol_blacklist6 2>/dev/null
-        
-        info "iptables规则已删除"
-    fi
-    
-    # 清理ID列表
+    nft delete table inet timecontrol 2>/dev/null && info "nftables规则已删除"
     rm -f "$IDLIST"
 }
 
-# 添加设备到防火墙
+# ---------- 添加设备（根据模式添加至对应集合） ----------
 add_device() {
     local id="$1"
     local target=$(config_t_get device mac "$id")
@@ -297,10 +247,10 @@ add_device() {
     info "添加设备到防火墙: $comment ($target)"
     
     local parsed_result=$(parse_target "$target")
-    if [ $? -ne 0 ]; then
+    [ $? -ne 0 ] && {
         info "添加失败: 无法解析地址 $target"
         return
-    fi
+    }
     
     local type subtype value
     IFS=':' read -r type subtype value <<EOF
@@ -308,40 +258,28 @@ $parsed_result
 EOF
     dbg "解析结果: type=$type, subtype=$subtype, value=$value"
     
-    if [ -n "$nftables_ver" ]; then
-        # nftables处理
-        case "$type" in
-            "ipv4")
-                nft add element inet timecontrol blacklist "{ $value }" 2>&1 | while read line; do dbg "nft: $line"; done
-                dbg "已添加到nftables黑名单(IPv4): $value"
-                ;;
-            "ipv6")
-                nft add element inet timecontrol blacklist6 "{ $value }" 2>&1 | while read line; do dbg "nft: $line"; done
-                dbg "已添加到nftables黑名单(IPv6): $value"
-                ;;
-            "mac")
-                nft add element inet timecontrol blacklist_mac "{ $value }" 2>&1 | while read line; do dbg "nft: $line"; done
-                dbg "已添加到nftables黑名单(MAC): $value"
-                ;;
-        esac
-        
-    elif [ -n "$iptables_ver" ]; then
-        # iptables处理
-        case "$type" in
-            "ipv4")
-                ipset add timecontrol_blacklist "$value" 2>&1 | while read line; do dbg "ipset: $line"; done
-                dbg "已添加到ipset黑名单(IPv4): $value"
-                ;;
-            "ipv6")
-                ipset add timecontrol_blacklist6 "$value" 2>&1 | while read line; do dbg "ipset: $line"; done
-                dbg "已添加到ipset黑名单(IPv6): $value"
-                ;;
-            "mac")
-                # iptables不支持MAC地址直接过滤，记录日志
-                info "警告: iptables不支持MAC地址过滤，设备 $target 可能无法被阻止"
-                ;;
-        esac
+    # [FIX] 根据 list_type 决定添加到黑名单还是白名单集合
+    local set_name
+    if [ "$list_type" = "blacklist" ]; then
+        set_name="blacklist"
+    else
+        set_name="whitelist"
     fi
+    
+    case "$type" in
+        "ipv4")
+            nft add element inet timecontrol $set_name "{ $value }" 2>&1 | while read line; do dbg "nft: $line"; done
+            dbg "已添加到nftables $set_name (IPv4): $value"
+            ;;
+        "ipv6")
+            nft add element inet timecontrol ${set_name}6 "{ $value }" 2>&1 | while read line; do dbg "nft: $line"; done
+            dbg "已添加到nftables ${set_name}6 (IPv6): $value"
+            ;;
+        "mac")
+            nft add element inet timecontrol ${set_name}_mac "{ $value }" 2>&1 | while read line; do dbg "nft: $line"; done
+            dbg "已添加到nftables ${set_name}_mac (MAC): $value"
+            ;;
+    esac
     
     # 强控制模式清理连接
     if [ "$StrongCHAIN" -eq 1 ]; then
@@ -349,33 +287,47 @@ EOF
         flush_connections "$target"
     fi
     
-    # 验证规则
-    verify_firewall_rule "$target"
+    # [FIX] 改进验证：使用 nft get element 精确检查
+    verify_firewall_rule "$target" "$set_name"
 }
 
-# 验证防火墙规则
+# ---------- 验证规则（精确） ----------
 verify_firewall_rule() {
     local target="$1"
+    local set_name="$2"
+    [ -z "$set_name" ] && {
+        [ "$list_type" = "blacklist" ] && set_name="blacklist" || set_name="whitelist"
+    }
+    dbg "验证防火墙规则: $target 在集合 $set_name 中"
     
-    dbg "验证防火墙规则: $target"
+    # [FIX] 通过 nft get element 精确验证
+    local parsed_result=$(parse_target "$target")
+    [ $? -ne 0 ] && {
+        dbg "无法解析，跳过验证"
+        return 1
+    }
+    local type subtype value
+    IFS=':' read -r type subtype value <<EOF
+$parsed_result
+EOF
+    local set_full_name="$set_name"
+    case "$type" in
+        "ipv4") set_full_name="$set_name" ;;
+        "ipv6") set_full_name="${set_name}6" ;;
+        "mac")  set_full_name="${set_name}_mac" ;;
+        *) dbg "未知类型，跳过验证"; return 1 ;;
+    esac
     
-    if [ -n "$nftables_ver" ]; then
-        nft list table inet timecontrol 2>/dev/null | grep -q "$target" && {
-            dbg "验证成功: $target 在nftables规则中"
-            return 0
-        }
-    elif [ -n "$iptables_ver" ]; then
-        ipset test timecontrol_blacklist "$target" 2>/dev/null && {
-            dbg "验证成功: $target 在ipset中"
-            return 0
-        }
+    if nft get element inet timecontrol "$set_full_name" "{ $value }" >/dev/null 2>&1; then
+        dbg "验证成功: $target 在 $set_full_name 中"
+        return 0
+    else
+        dbg "验证失败: $target 不在 $set_full_name 中"
+        return 1
     fi
-    
-    dbg "验证失败: $target 不在防火墙规则中"
-    return 1
 }
 
-# 从防火墙移除设备
+# ---------- 移除设备 ----------
 del_device() {
     local id="$1"
     local target=$(config_t_get device mac "$id")
@@ -388,7 +340,7 @@ del_device() {
     info "从防火墙移除设备: $comment ($target)"
     
     local parsed_result=$(parse_target "$target")
-    [ $? -eq 0 ] || {
+    [ $? -ne 0 ] && {
         info "移除失败: 无法解析地址 $target"
         return
     }
@@ -398,83 +350,54 @@ del_device() {
 $parsed_result
 EOF
     
-    if [ -n "$nftables_ver" ]; then
-        case "$type" in
-            "ipv4")
-                nft delete element inet timecontrol blacklist "{ $value }" 2>/dev/null
-                dbg "已从nftables移除(IPv4): $value"
-                ;;
-            "ipv6")
-                nft delete element inet timecontrol blacklist6 "{ $value }" 2>/dev/null
-                dbg "已从nftables移除(IPv6): $value"
-                ;;
-            "mac")
-                nft delete element inet timecontrol blacklist_mac "{ $value }" 2>/dev/null
-                dbg "已从nftables移除(MAC): $value"
-                ;;
-        esac
-        
-    elif [ -n "$iptables_ver" ]; then
-        case "$type" in
-            "ipv4")
-                ipset del timecontrol_blacklist "$value" 2>/dev/null
-                dbg "已从ipset移除(IPv4): $value"
-                ;;
-            "ipv6")
-                ipset del timecontrol_blacklist6 "$value" 2>/dev/null
-                dbg "已从ipset移除(IPv6): $value"
-                ;;
-        esac
+    local set_name
+    if [ "$list_type" = "blacklist" ]; then
+        set_name="blacklist"
+    else
+        set_name="whitelist"
     fi
+    
+    case "$type" in
+        "ipv4")
+            nft delete element inet timecontrol $set_name "{ $value }" 2>/dev/null
+            dbg "已从nftables $set_name 移除(IPv4): $value"
+            ;;
+        "ipv6")
+            nft delete element inet timecontrol ${set_name}6 "{ $value }" 2>/dev/null
+            dbg "已从nftables ${set_name}6 移除(IPv6): $value"
+            ;;
+        "mac")
+            nft delete element inet timecontrol ${set_name}_mac "{ $value }" 2>/dev/null
+            dbg "已从nftables ${set_name}_mac 移除(MAC): $value"
+            ;;
+    esac
 }
 
-# 显示防火墙状态
+# ---------- 显示状态 ----------
 show_firewall_status() {
     echo ""
     echo "防火墙状态:"
     echo "控制模式: $list_type"
     echo "控制强度: $chain $( [ "$StrongCHAIN" -eq 1 ] && echo "(强控制)" )"
     echo ""
-    
-    if [ -n "$nftables_ver" ]; then
-        echo "nftables规则:"
-        nft list table inet timecontrol 2>/dev/null || echo "  未找到timecontrol表"
-    elif [ -n "$iptables_ver" ]; then
-        echo "iptables规则:"
-        echo "FORWARD链:"
-        iptables -L FORWARD -n | grep -i timecontrol || echo "  未找到timecontrol规则"
-        ip6tables -L FORWARD -n | grep -i timecontrol || echo "  未找到IPv6 timecontrol规则"
-        
-        if [ "$StrongCHAIN" -eq 1 ]; then
-            echo ""
-            echo "INPUT链:"
-            iptables -L INPUT -n | grep -i timecontrol || echo "  未找到timecontrol规则"
-            ip6tables -L INPUT -n | grep -i timecontrol || echo "  未找到IPv6 timecontrol规则"
-        fi
-        
-        echo ""
-        echo "ipset内容:"
-        ipset list timecontrol_blacklist 2>/dev/null | head -20 || echo "  timecontrol_blacklist未找到"
-        echo ""
-        ipset list timecontrol_blacklist6 2>/dev/null | head -20 || echo "  timecontrol_blacklist6未找到"
-    fi
+    echo "nftables规则:"
+    nft list table inet timecontrol 2>/dev/null || echo "  未找到timecontrol表"
 }
 
-# 诊断函数
+# ---------- 诊断（进程名统一为 timecontrol） ----------
 diagnose() {
     echo ""
     echo "=== 时间控制系统诊断 ==="
     echo ""
     
-    # 检查服务
+    # [FIX] 进程名改为 timecontrol（与 init 脚本一致）
     echo "1. 服务状态:"
-    if ps | grep -q "timecontrolctrl"; then
-        echo "   ✓ timecontrolctrl 正在运行"
+    if ps | grep -q "timecontrol"; then
+        echo "   ✓ timecontrol 正在运行"
     else
-        echo "   ✗ timecontrolctrl 未运行"
+        echo "   ✗ timecontrol 未运行"
     fi
     
-    # 检查配置文件
     echo ""
     echo "2. 配置文件:"
     if [ -f "/etc/config/timecontrol" ]; then
@@ -486,41 +409,41 @@ diagnose() {
         echo "   ✗ 配置文件不存在"
     fi
     
-    # 检查防火墙工具
     echo ""
     echo "3. 防火墙工具:"
     if [ -x "$bin_nft" ]; then
         echo "   ✓ nftables: $bin_nft"
         echo "   版本: $($bin_nft --version 2>/dev/null | head -1)"
-    elif [ -x "$bin_iptables" ]; then
-        echo "   ✓ iptables: $bin_iptables"
-        echo "   版本: $($bin_iptables --version 2>/dev/null | head -1)"
     else
-        echo "   ✗ 未找到防火墙工具"
+        echo "   ✗ 未找到 nftables"
     fi
     
-    # 显示当前规则
     show_firewall_status
     
-    # 检查ID列表
     echo ""
     echo "4. 当前控制列表:"
     if [ -f "$IDLIST" ] && [ -s "$IDLIST" ]; then
-        echo "   当前禁止的设备:"
+        echo "   当前控制的设备:"
         cat "$IDLIST" | sed 's/!//g' | while read id; do
             local target=$(config_t_get device mac "$id")
             local comment=$(config_t_get device comment "$id" "设备$id")
             echo "   ID$id: $comment ($target)"
         done
     else
-        echo "   当前没有设备被禁止"
+        echo "   当前没有设备被控制"
     fi
-    
     echo ""
     echo "=== 诊断完成 ==="
 }
 
-# 主命令处理
+# ---------- 主命令处理（加锁） ----------
+# [FIX] 添加锁机制防止并发
+exec 200>"$LOCK_FILE"
+flock -n 200 || {
+    echo "另一个实例正在运行，退出"
+    exit 1
+}
+
 case "$crrun" in
     "start")
         info "启动时间控制"
@@ -533,13 +456,22 @@ case "$crrun" in
             info "时间控制启动失败"
         fi
         ;;
-        
     "stop")
         info "停止时间控制"
         stop_firewall
         info "时间控制已停止"
         ;;
-        
+    "restart"|"reload")   # [FIX] 增加 reload
+        info "重启时间控制"
+        stop_firewall
+        init_firewall
+        if [ $? -eq 0 ]; then
+            info "时间控制重启成功"
+            show_firewall_status
+        else
+            info "时间控制重启失败"
+        fi
+        ;;
     "add")
         [ -z "$crid" ] && {
             echo "错误: 需要指定设备ID"
@@ -547,9 +479,12 @@ case "$crrun" in
         }
         info "添加设备控制: ID=$crid"
         add_device "$crid"
+        # [FIX] 更新 IDLIST
+        if ! grep -q "!$crid!" "$IDLIST" 2>/dev/null; then
+            echo "!$crid!" >> "$IDLIST"
+        fi
         show_firewall_status
         ;;
-        
     "del")
         [ -z "$crid" ] && {
             echo "错误: 需要指定设备ID"
@@ -557,21 +492,18 @@ case "$crrun" in
         }
         info "移除设备控制: ID=$crid"
         del_device "$crid"
+        sed -i "/!$crid!/d" "$IDLIST" 2>/dev/null
         show_firewall_status
         ;;
-        
     "status")
         show_firewall_status
         ;;
-        
     "diagnose")
         diagnose
         ;;
-        
     "test")
-        # 测试地址解析
         echo "测试地址解析:"
-        for test in "192.168.1.100" "192.168.1.0/24" "00:11:22:33:44:55" "invalid"; do
+        for test in "192.168.1.100" "192.168.1.0/24" "00:11:22:33:44:55" "2001:db8::1" "invalid"; do
             echo -n "$test: "
             if parse_target "$test" >/dev/null; then
                 echo "✓ 有效"
@@ -581,26 +513,26 @@ case "$crrun" in
             fi
         done
         ;;
-        
     "flush")
-        # 清理所有连接
         info "清理所有连接"
+        local bin_conntrack=$(which conntrack 2>/dev/null)
         if [ -x "$bin_conntrack" ]; then
             $bin_conntrack -F
+            $bin_conntrack -F -f ipv6 2>/dev/null
             info "连接已清理"
         else
             info "conntrack不可用"
         fi
         ;;
-        
     "help"|"")
         echo "时间控制系统命令工具"
         echo ""
-        echo "用法: $0 {start|stop|add <id>|del <id>|status|diagnose|test|flush|help}"
+        echo "用法: $0 {start|stop|restart|add <id>|del <id>|status|diagnose|test|flush|help}"
         echo ""
         echo "命令说明:"
         echo "  start           - 初始化防火墙规则"
         echo "  stop            - 停止并清理所有防火墙规则"
+        echo "  restart/reload  - 重启防火墙"
         echo "  add <id>        - 添加设备到控制列表"
         echo "  del <id>        - 从控制列表移除设备"
         echo "  status          - 显示防火墙状态"
@@ -609,10 +541,12 @@ case "$crrun" in
         echo "  flush           - 清理所有网络连接"
         echo "  help            - 显示此帮助信息"
         ;;
-        
     *)
         echo "错误: 未知命令 '$crrun'"
         echo "使用: $0 help 查看帮助"
         exit 1
         ;;
 esac
+
+# 解锁
+flock -u 200
