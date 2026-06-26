@@ -69,17 +69,16 @@ jobs:
         run: |
           cd ${{ env.SDK_DIR }}
 
-          # ---- 删除已知有问题的包源码目录，避免被编译系统加载 ----
-          # libnetfilter 系列存在编译错误，且插件不依赖它们
+          # ---- 删除已知有问题的包源码目录（避免被编译系统加载） ----
           rm -rf feeds/packages/libs/libnetfilter-*
-          # luci-app-diskman 存在递归依赖，插件不依赖它
           rm -rf feeds/luci/applications/luci-app-diskman
+          rm -rf feeds/packages/net/conntrack-tools   # 依赖 libnfnetlink，但该库不存在
 
-          # 生成默认配置
+          # 第一次 defconfig：生成默认配置
           make defconfig
 
           # ---- 强制禁用这些包（多重保险） ----
-          for pkg in libnetfilter-cttimeout libnetfilter-cthelper libnetfilter-queue luci-app-diskman; do
+          for pkg in libnetfilter-cttimeout libnetfilter-cthelper libnetfilter-queue luci-app-diskman conntrack-tools; do
             sed -i "/^CONFIG_PACKAGE_${pkg}/d" .config
             echo "CONFIG_PACKAGE_${pkg}=n" >> .config
           done
@@ -90,15 +89,11 @@ jobs:
           echo "CONFIG_USE_APK=y" >> .config
           echo "CONFIG_PACKAGE_${{ github.event.inputs.PLUGIN_NAME }}=m" >> .config
 
-          # 自动处理新配置选项
+          # ---- 第二次 defconfig：刷新配置，使手动修改生效 ----
           make defconfig
 
-          # ---- 再次强制禁用（防止 olddefconfig 重新启用） ----
-          for pkg in libnetfilter-cttimeout libnetfilter-cthelper libnetfilter-queue luci-app-diskman; do
-            sed -i "/^CONFIG_PACKAGE_${pkg}/d" .config
-            echo "CONFIG_PACKAGE_${pkg}=n" >> .config
-          done
-          make defconfig
+          # 检查插件是否已正确启用
+          grep "^CONFIG_PACKAGE_${{ github.event.inputs.PLUGIN_NAME }}" .config || echo "警告：插件未在 .config 中启用"
 
       # 下载依赖 + 编译插件
       - name: Build Plugin Only
