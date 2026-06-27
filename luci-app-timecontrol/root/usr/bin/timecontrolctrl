@@ -481,10 +481,15 @@ update_device_status() {
     fi
 }
 
-# 主处理循环
+
+# ============= 主循环（流量感知版） =============
 main_loop() {
     info "时间控制守护进程启动"
     init_dirs
+    read_traffic_config  # 读取配置
+    info "流量感知: $([ "$TRAFFIC_ENABLED" = "1" ] && echo "启用" || echo "禁用")"
+    info "阈值: ${TRAFFIC_THRESHOLD_KB}KB, 连续次数: ${TRAFFIC_CONSECUTIVE}, 轮询间隔: ${TRAFFIC_POLL_INTERVAL}s"
+    
     while :; do
         dbg "开始检查设备"
         count=$(uci show "$NAME" 2>/dev/null | grep "enable='1'" | grep "device" | grep -oE '\[[0-9]+\]' | grep -oE '[0-9]+' | sort -n | wc -l)
@@ -492,14 +497,49 @@ main_loop() {
             timecontrol stop
             break
         fi
+        
         for id in $(get_enabled_devices); do
-            if check_device_control "$id"; then
+            local target=$(config_t_get device mac "$id")
+            local allow=$(check_device_control "$id"; echo $?)   # 0允许，1禁止
+            
+            # 更新防火墙规则
+            if [ "$allow" -eq 0 ]; then
                 update_device_status "$id" 0
             else
                 update_device_status "$id" 1
             fi
+            
+            # 如果设备被禁止上网，无需流量检测（已经断开计时）
+            if [ "$allow" -ne 0 ]; then
+                continue
+            fi
+            
+            # 如果流量感知未启用，则不做额外处理（计时由 check_device_control 中的 record_connection_time 管理）
+            if [ "$TRAFFIC_ENABLED" = "0" ]; then
+                continue
+            fi
+            
+            # === 流量感知逻辑 ===
+            local is_active=$(update_traffic_state "$target")
+            local current_conn=$(grep ",$target," "$CONNECTION_LOG" 2>/dev/null | tail -1 | cut -d',' -f3)
+            
+            if [ "$is_active" = "1" ]; then
+                # 活跃，若未连接则开始计时
+                if [ "$current_conn" != "connect" ]; then
+                    dbg "设备 $target 流量活跃，开始计时"
+                    record_connection_time "$target" "connect"
+                fi
+            else
+                # 不活跃，若已连接则暂停计时
+                if [ "$current_conn" = "connect" ]; then
+                    dbg "设备 $target 流量不活跃，暂停计时"
+                    record_connection_time "$target" "disconnect"
+                fi
+            fi
         done
-        sleep 60
+        
+        # 使用配置的轮询间隔
+        sleep "${TRAFFIC_POLL_INTERVAL:-30}"
     done
 }
 
