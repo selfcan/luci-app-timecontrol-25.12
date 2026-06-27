@@ -101,24 +101,24 @@ jobs:
           make -j$(nproc) package/${{ github.event.inputs.PLUGIN_NAME }}/download
           make -j1 package/${{ github.event.inputs.PLUGIN_NAME }}/compile V=s
 
-      - name: Archive Output
+     # ---------- 打包 apk 文件 ----------
+      - name: Package Firmware
         run: |
-          BIN=${{ env.SDK_DIR }}/bin/packages/${{ env.ARCH }}
-          TAR=${{ env.ARCH }}_${{ github.event.inputs.PLUGIN_NAME }}.tar.gz
-          tar -zcvf $TAR -C $BIN .
-          echo "TAR=$TAR" >> $GITHUB_ENV
+          cd ${{ env.SDK_DIR }}
+          mkdir -p ./upload/
+          # 递归查找所有 .apk 文件（包含 packages/ 和 base/ 等子目录）
+          find ./bin/packages/${{ env.ARCH }}/ -type f -name "*.apk" -exec cp {} ./upload/ \;
+          echo "已复制以下文件："
+          ls -l ./upload/
 
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
+      # ---------- 发布到 Release ----------
+      - name: Release Firmware
+        uses: softprops/action-gh-release@master
         with:
-          name: ${{ env.TAR }}
-          path: ${{ env.TAR }}
-
-      - name: Release Asset
-        uses: ncipollo/release-action@v1
-        with:
-          name: ${{ github.ref_name }}-${{ github.event.inputs.PLUGIN_NAME }}
-          token: ${{ secrets.GITHUB_TOKEN }}
-          allowUpdates: true
-          replacesArtifacts: true
-          artifacts: ${{ env.TAR }}
+          tag_name: ${{ github.ref_name }}-${{ github.event.inputs.PLUGIN_NAME }}
+          files: ${{ env.SDK_DIR }}/upload/*.apk
+          body: |
+            编译完成，未测试！
+            插件：${{ github.event.inputs.PLUGIN_NAME }}
+            架构：${{ env.ARCH }}
+            编译时间：$(date -u +"%Y-%m-%d %H:%M:%S UTC")
