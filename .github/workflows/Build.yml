@@ -46,6 +46,7 @@ jobs:
           PLG=${{ github.event.inputs.PLUGIN_NAME }}
           git clone --depth 1 --branch ${{ github.event.inputs.PLUGIN_BRANCH }} \
             ${{ github.event.inputs.PLUGIN_REPO }} tmp_plg
+          rm -rf package/$PLG
           mkdir -p package/$PLG
           mv tmp_plg/$PLG/* package/$PLG/
           rm -rf tmp_plg
