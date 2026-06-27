@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 /*
- * Copyright (C) 2022-2026 sirpdboy <herboy2008@gmail.com>
- * 修改：支持多时段、重置按钮、已用时长显示
+ * 上网时间控制 - 修复版 v3.3.18-fix-modal-display
+ * 修复：编辑模态框中控制模式、重置周期、星期、启用显示与配置不一致
  */
 'use strict';
 'require view';
@@ -13,405 +13,852 @@
 'require rpc';
 'require network';
 
-function checkTimeControlProcess() {
-    return fs.exec('/bin/ps', ['w']).then(function(res) {
-        if (res.code !== 0) {
-            return { running: false, pid: null };
+const VERSION = "v3.3.18-fix-modal-display";
+const NOTIFY_TIMEOUT = 5000;
+
+function debugLog(msg, obj) {
+    if (window.console) {
+        if (obj !== undefined) console.log('[TimeControl][' + VERSION + ']', msg, obj);
+        else console.log('[TimeControl][' + VERSION + ']', msg);
+    }
+}
+
+function showTip(msg, type) {
+    type = type || 'info';
+    ui.addNotification(null, E('p', msg), type, NOTIFY_TIMEOUT);
+}
+
+// 统一执行UCI持久化提交
+function uciCommitConfig() {
+    debugLog('执行系统命令: uci commit timecontrol');
+    return fs.exec_direct('/sbin/uci', ['commit', 'timecontrol'])
+        .then(function(res) {
+            debugLog('uci commit 执行成功', res);
+            return true;
+        })
+        .catch(function(err) {
+            console.error('[TimeControl] uci commit 执行失败:', err);
+            throw new Error('写入配置文件失败: ' + (err.message || err));
+        });
+}
+
+// ===== 全局样式 =====
+(function injectStyles() {
+    var styleId = 'timecontrol-style-' + VERSION;
+    if (document.getElementById(styleId)) return;
+    var style = document.createElement('style');
+    style.id = styleId;
+    style.textContent = `
+        .tc-container { padding: 10px; font-size: 16px; }
+        .tc-table-wrap { overflow-x: auto; max-width: 100%; }
+        .tc-table { width: 100%; border-collapse: collapse; font-size: 15px; }
+        .tc-table th { background: #f0f0f0; padding: 10px 8px; text-align: left; white-space: nowrap; border-bottom: 2px solid #ccc; font-size: 15px; }
+        .tc-table td { padding: 8px; border-bottom: 1px solid #e0e0e0; vertical-align: middle; font-size: 15px; }
+        .tc-table tr:hover { background: #f9f9f9; }
+        .tc-table .comment-cell { max-width: 160px; word-break: break-word; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+        .tc-table .mac-cell { min-width: 170px; }
+        .tc-table .mode-cell { min-width: 120px; }
+        .tc-table .duration-cell { min-width: 110px; }
+        .tc-table .usage-cell { min-width: 120px; font-weight: bold; }
+        .tc-table .period-detail-cell { min-width: 200px; max-width: 250px; word-break: break-word; }
+        .tc-table .actions-cell { white-space: nowrap; min-width: 220px; }
+        .tc-btn { margin: 0 3px; padding: 5px 10px; border-radius: 3px; border: 1px solid #aaa; background: #fff; cursor: pointer; font-size: 14px; }
+        .tc-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+        .tc-btn:hover { background: #eee; }
+        .tc-btn-reset { background: #f0ad4e; border-color: #eea236; color: #fff; }
+        .tc-btn-reset:hover { background: #ec971f; }
+        .tc-btn-del { background: #d9534f; border-color: #d43f3a; color: #fff; }
+        .tc-btn-del:hover { background: #c9302c; }
+        .tc-btn-edit { background: #5bc0de; border-color: #46b8da; color: #fff; }
+        .tc-btn-edit:hover { background: #31b0d5; }
+        .tc-btn-add { background: #5cb85c; border-color: #4cae4c; color: #fff; padding: 6px 18px; font-size: 15px; }
+        .tc-btn-add:hover { background: #449d44; }
+        .tc-btn-save { background: #337ab7; border-color: #2e6da4; color: #fff; }
+        .tc-btn-save:hover { background: #286090; }
+        .tc-btn-cancel { background: #777; border-color: #666; color: #fff; }
+        .tc-btn-cancel:hover { background: #555; }
+        .tc-status { margin: 10px 0; padding: 10px; background: #f5f5f5; border-radius: 4px; font-size: 16px; }
+        .tc-empty { color: #999; font-style: italic; text-align: center; padding: 20px; font-size: 15px; }
+        .tc-modal-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000; display: flex; justify-content: center; align-items: center; }
+        .tc-modal { background: #fff; border-radius: 6px; padding: 20px; max-width: 750px; width: 95%; max-height: 90vh; overflow-y: auto; box-shadow: 0 4px 12px rgba(0,0,0,0.3); }
+        .tc-modal h3 { margin-top: 0; border-bottom: 1px solid #ddd; padding-bottom: 10px; font-size: 18px; }
+        .tc-modal .form-group { display: flex; flex-wrap: wrap; margin-bottom: 10px; align-items: center; }
+        .tc-modal .form-group label { width: 120px; font-weight: bold; font-size: 15px; }
+        .tc-modal .form-group input, .tc-modal .form-group select { flex: 1; padding: 5px 10px; border-radius: 3px; border: 1px solid #ccc; min-width: 150px; font-size: 15px; }
+        .tc-modal .form-group .field-group { display: flex; flex-wrap: wrap; gap: 10px; flex: 1; }
+        .tc-modal .form-group .field-group input { flex: 1; min-width: 80px; }
+        .tc-modal .form-actions { margin-top: 15px; text-align: right; }
+        .tc-modal .form-actions button { margin-left: 8px; font-size: 15px; }
+        .tc-modal .period-group { border-left: 3px solid #5bc0de; padding-left: 10px; margin: 5px 0 10px 0; }
+        .tc-modal .period-group label { width: 80px; }
+        .tc-modal .help-text { font-size: 14px; color: #666; margin: 4px 0 8px 0; padding-left: 120px; }
+        .tc-hidden { display: none !important; }
+        .tc-add-bar { margin: 10px 0; text-align: right; }
+        .tc-global-settings { background: #f9f9f9; padding: 12px; border-radius: 4px; margin: 10px 0; display: flex; flex-wrap: wrap; gap: 20px; align-items: center; }
+        .tc-global-settings label { font-weight: bold; margin-right: 6px; font-size: 15px; }
+        .tc-global-settings select { padding: 5px 10px; border-radius: 3px; border: 1px solid #ccc; font-size: 15px; }
+        .tc-device-select { display: flex; gap: 8px; flex: 1; }
+        .tc-device-select select { flex: 1; }
+        .tc-device-select input { flex: 2; }
+        #version-tip { background: #e7f3ff; padding: 10px; border: 1px solid #b3d8ff; border-radius: 4px; margin-bottom: 10px; font-size: 15px; }
+        #version-tip strong { color: #0066cc; font-size: 16px; }
+        #version-tip small { color: #333; font-size: 14px; }
+    `;
+    document.head.appendChild(style);
+    debugLog('全局样式注入完成');
+})();
+
+// ===== 工具函数 =====
+function getDeviceList() {
+    var devices = [];
+    uci.sections('timecontrol', 'device', function(s) {
+        devices.push(s);
+    });
+    return devices;
+}
+
+function getDeviceById(id) {
+    var dev = null;
+    uci.sections('timecontrol', 'device', function(s) {
+        if (s['.name'] === id) {
+            dev = s;
         }
-        var lines = res.stdout.split('\n');
-        var running = false;
-        var pid = null;
-        for (var i = 0; i < lines.length; i++) {
-            var line = lines[i];
-            if (line.includes('timecontrolctrl')) {
-                running = true;
-                var match = line.match(/^\s*(\d+)/);
-                if (match) {
-                    pid = match[1];
-                }
-                break;
+    });
+    return dev;
+}
+
+// 设备保存，串行执行save+系统commit
+function saveDevice(section, data) {
+    debugLog('开始保存设备配置, section=' + (section || '新建'));
+    return uci.load('timecontrol').then(function() {
+        var targetSection = section;
+        if (!targetSection) {
+            targetSection = uci.add('timecontrol', 'device');
+            debugLog('创建设备新节: ' + targetSection);
+        }
+        Object.keys(data).forEach(function(key) {
+            if (data[key] !== undefined && data[key] !== null) {
+                uci.set('timecontrol', targetSection, key, data[key]);
             }
-        }
-        return { running: running, pid: null };
-    }).catch(function() {
-        return { running: false, pid: null };
+        });
+        return uci.save('timecontrol');
+    }).then(function() {
+        debugLog('UCI缓存保存成功，开始写入配置文件');
+        return uciCommitConfig();
+    }).then(function() {
+        debugLog('设备配置已成功写入文件');
+        return true;
+    }).catch(function(err) {
+        console.error('[TimeControl] 保存设备失败:', err);
+        throw err;
     });
 }
 
-function renderServiceStatus(isRunning, pid) {
-    var statusText = isRunning ? _('RUNNING') : _('NOT RUNNING');
-    var color = isRunning ? 'green' : 'red';
-    var icon = isRunning ? '✓' : '✗';
-    var statusHtml = String.format(
-        '<em><span style="color:%s">%s <strong>%s %s</strong></span></em>',
-        color, icon, _('TimeControl Service'), statusText
-    );
-    if (isRunning && pid) {
-        statusHtml += ' <small>(PID: ' + pid + ')</small>';
+// 删除设备，串行执行save+系统commit
+function deleteDevice(section) {
+    debugLog('开始删除设备节: ' + section);
+    if (!section) {
+        showTip(_('删除失败：设备标识无效'), 'error');
+        return Promise.reject(new Error('section is empty'));
     }
-    return statusHtml;
+    return uci.load('timecontrol').then(function() {
+        var exists = false;
+        uci.sections('timecontrol', 'device', function(s) {
+            if (s['.name'] === section) exists = true;
+        });
+        if (!exists) {
+            throw new Error('设备配置节不存在');
+        }
+        if (typeof uci.delete === 'function') {
+            uci.delete('timecontrol', section);
+        } else if (typeof uci.remove === 'function') {
+            uci.remove('timecontrol', section);
+        } else {
+            uci.set('timecontrol', section, null);
+        }
+        debugLog('内存中已标记删除，保存缓存');
+        return uci.save('timecontrol');
+    }).then(function() {
+        debugLog('缓存保存成功，提交到配置文件');
+        return uciCommitConfig();
+    }).then(function() {
+        debugLog('删除已写入配置文件');
+        showTip(_('删除成功'), 'info');
+        return true;
+    }).catch(function(err) {
+        console.error('[TimeControl] 删除失败:', err);
+        showTip(_('删除失败：') + err.message, 'error');
+        throw err;
+    });
 }
 
-var cbiRichListValue = form.ListValue.extend({
-    renderWidget: function(section_id, option_index, cfgvalue) {
-        var choices = this.transformChoices();
-        var widget = new ui.Dropdown((cfgvalue != null) ? cfgvalue : this.default, choices, {
-            id: this.cbid(section_id),
-            sort: this.keylist,
-            optional: true,
-            select_placeholder: this.select_placeholder || this.placeholder,
-            custom_placeholder: this.custom_placeholder || this.placeholder,
-            validate: L.bind(this.validate, this, section_id),
-            disabled: (this.readonly != null) ? this.readonly : this.map.readonly
+// 初始化全局配置节
+function ensureGlobalSection() {
+    return fs.exec_direct('/sbin/uci', ['get', 'timecontrol.timecontrol'])
+        .then(function() {
+            debugLog('全局配置节 timecontrol 已存在');
+            return true;
+        })
+        .catch(function() {
+            debugLog('全局配置节不存在，创建默认配置');
+            return fs.exec_direct('/sbin/uci', ['set', 'timecontrol.timecontrol=timecontrol'])
+                .then(function() {
+                    return fs.exec_direct('/sbin/uci', ['set', 'timecontrol.timecontrol.list_type=blacklist']);
+                })
+                .then(function() {
+                    return fs.exec_direct('/sbin/uci', ['set', 'timecontrol.timecontrol.chain=forward']);
+                })
+                .then(function() {
+                    return fs.exec_direct('/sbin/uci', ['commit', 'timecontrol']);
+                })
+                .then(function() {
+                    debugLog('全局配置节初始化完成');
+                    return true;
+                });
         });
-        return widget.render();
-    },
-    value: function(value, title, description) {
-        if (description) {
-            form.ListValue.prototype.value.call(this, value, E([], [
-                E('span', { 'class': 'hide-open' }, [title]),
-                E('div', { 'class': 'hide-close', 'style': 'min-width:25vw' }, [
-                    E('strong', [title]),
-                    E('br'),
-                    E('span', { 'style': 'white-space:normal' }, description)
-                ])
-            ]));
-        } else {
-            form.ListValue.prototype.value.call(this, value, title);
+}
+
+// 读取全局配置，增加 trim 处理
+function getGlobalSetting(key, def) {
+    var val = uci.get('timecontrol', 'timecontrol', key);
+    if (val !== undefined && val !== null) {
+        val = val.trim();
+        if (val === '') {
+            return def;
+        }
+        return val;
+    }
+    return def;
+}
+
+// 保存全局配置
+function setGlobalSetting(key, value) {
+    debugLog('保存全局设置: ' + key + '=' + value);
+    return uci.load('timecontrol').then(function() {
+        var sectionExists = false;
+        uci.sections('timecontrol', function(s) {
+            if (s['.name'] === 'timecontrol') sectionExists = true;
+        });
+        if (!sectionExists) {
+            uci.set('timecontrol', 'timecontrol', 'list_type', 'blacklist');
+            uci.set('timecontrol', 'timecontrol', 'chain', 'forward');
+        }
+        uci.set('timecontrol', 'timecontrol', key, value);
+        return uci.save('timecontrol');
+    }).then(function() {
+        return uciCommitConfig();
+    }).then(function() {
+        debugLog('全局设置写入文件成功: ' + key + '=' + value);
+        return true;
+    }).catch(function(err) {
+        console.error('[TimeControl] 全局设置保存失败:', err);
+        throw err;
+    });
+}
+
+function getDeviceUsage(id) {
+    return fs.exec_direct('/usr/bin/timecontrol', ['getusage', id, 'all'])
+        .then(function(res) {
+            return res.trim();
+        })
+        .catch(function() {
+            return '--';
+        });
+}
+
+function resetDevice(id) {
+    return fs.exec_direct('/usr/bin/timecontrol', ['reset', id]);
+}
+
+function checkTimeControlProcess() {
+    return fs.exec('/bin/ps', ['w']).then(function(res) {
+        if (res.code !== 0) return { running: false, pid: null };
+        var lines = res.stdout.split('\n');
+        var running = false, pid = null;
+        for (var i = 0; i < lines.length; i++) {
+            if (lines[i].includes('timecontrolctrl')) {
+                running = true;
+                var match = lines[i].match(/^\s*(\d+)/);
+                if (match) pid = match[1];
+                break;
+            }
+        }
+        return { running: running, pid: pid };
+    }).catch(function() { return { running: false, pid: null }; });
+}
+
+// ===== 构建编辑模态框（修复下拉框显示） =====
+function buildModal(title, data, hosts) {
+    data = data || {};
+    var isEdit = !!data['.name'];
+    var sectionId = data['.name'] || null;
+
+    var defaults = {
+        comment: '',
+        enable: '1',
+        mac: '',
+        time_mode: 'period',
+        timestart: '00:00',
+        timeend: '00:00',
+        duration: '60',
+        use_duration: '0',
+        reset_cycle: 'daily',
+        week: '0',
+        period1_start: '00:00',
+        period1_end: '00:00',
+        period1_duration: '60',
+        period2_start: '00:00',
+        period2_end: '00:00',
+        period2_duration: '60',
+        period3_start: '00:00',
+        period3_end: '00:00',
+        period3_duration: '60'
+    };
+    var config = {};
+    Object.keys(defaults).forEach(function(k) {
+        config[k] = data[k] !== undefined ? data[k] : defaults[k];
+    });
+    // ★★★ 对字符串值进行 trim，避免空格干扰 ★★★
+    if (typeof config.time_mode === 'string') config.time_mode = config.time_mode.trim();
+    if (typeof config.reset_cycle === 'string') config.reset_cycle = config.reset_cycle.trim();
+    if (typeof config.week === 'string') config.week = config.week.trim();
+    if (typeof config.enable === 'string') config.enable = config.enable.trim();
+
+    var overlay = E('div', { class: 'tc-modal-overlay' });
+    var modal = E('div', { class: 'tc-modal' });
+
+    var titleEl = E('h3', {}, title);
+    modal.appendChild(titleEl);
+
+    var formBox = E('div');
+
+    // 备注
+    var group1 = E('div', { class: 'form-group' });
+    group1.appendChild(E('label', {}, _('备注')));
+    group1.appendChild(E('input', { id: 'edit-comment', type: 'text', value: config.comment, placeholder: _('设备描述') }));
+    formBox.appendChild(group1);
+
+    // ★★★ 启用（修复：移除 selected，使用 value） ★★★
+    var group2 = E('div', { class: 'form-group' });
+    group2.appendChild(E('label', {}, _('启用')));
+    var enableSelect = E('select', { id: 'edit-enable' });
+    enableSelect.appendChild(E('option', { value: '1' }, _('是')));
+    enableSelect.appendChild(E('option', { value: '0' }, _('否')));
+    enableSelect.value = config.enable; // ★ 强制设置
+    group2.appendChild(enableSelect);
+    formBox.appendChild(group2);
+
+    // MAC/IP + 设备选择
+    var group3 = E('div', { class: 'form-group' });
+    group3.appendChild(E('label', {}, _('IP/MAC 地址')));
+    var selectContainer = E('div', { class: 'tc-device-select' });
+    var macInput = E('input', { id: 'edit-mac', type: 'text', value: config.mac, placeholder: '例如 192.168.1.100 或 AA:BB:CC:DD:EE:FF', style: 'flex:2;' });
+    var deviceSelect = E('select', { id: 'edit-device-select', style: 'flex:1;' });
+    deviceSelect.appendChild(E('option', { value: '' }, _('-- 从网络设备选择 --')));
+    if (hosts) {
+        Object.keys(hosts).forEach(function(mac) {
+            var host = hosts[mac];
+            var name = host.name || _('未知设备');
+            var ips = L.toArray(host.ipaddrs || host.ipv4 || []);
+            var ip = ips.length > 0 ? ips[0] : '';
+            var label = name + ' (' + mac + (ip ? ', ' + ip : '') + ')';
+            deviceSelect.appendChild(E('option', { value: mac + (ip ? '||' + ip : '') }, label));
+        });
+    }
+    deviceSelect.addEventListener('change', function(ev) {
+        var val = ev.target.value;
+        if (val) {
+            var parts = val.split('||');
+            macInput.value = parts[0];
+        }
+    });
+    selectContainer.appendChild(deviceSelect);
+    selectContainer.appendChild(macInput);
+    group3.appendChild(selectContainer);
+    formBox.appendChild(group3);
+
+    // ★★★ 控制模式（修复：移除 selected，使用 value） ★★★
+    var group4 = E('div', { class: 'form-group' });
+    group4.appendChild(E('label', {}, _('控制模式')));
+    var modeSelect = E('select', { id: 'edit-time_mode' });
+    var modes = [
+        { value: 'period', label: _('时间段控制') },
+        { value: 'duration', label: _('时长控制') },
+        { value: 'combined', label: _('组合控制') },
+        { value: 'multi_period', label: _('多时段控制') }
+    ];
+    modes.forEach(function(m) {
+        var opt = E('option', { value: m.value }, m.label); // ★ 移除 selected
+        modeSelect.appendChild(opt);
+    });
+    modeSelect.value = config.time_mode; // ★ 强制设置
+    group4.appendChild(modeSelect);
+    formBox.appendChild(group4);
+
+    // 动态字段容器
+    var dynamicContainer = E('div', { id: 'dynamic-fields' });
+    formBox.appendChild(dynamicContainer);
+
+    // ★★★ 星期（修复：移除 selected，使用 value） ★★★
+    var groupWeek = E('div', { class: 'form-group' });
+    groupWeek.appendChild(E('label', {}, _('星期')));
+    var weekSelect = E('select', { id: 'edit-week' });
+    var weekOptions = [
+        { value: '0', label: _('每天') },
+        { value: '1', label: _('周一') },
+        { value: '2', label: _('周二') },
+        { value: '3', label: _('周三') },
+        { value: '4', label: _('周四') },
+        { value: '5', label: _('周五') },
+        { value: '6', label: _('周六') },
+        { value: '7', label: _('周日') },
+        { value: '1,2,3,4,5', label: _('工作日') },
+        { value: '6,7', label: _('休息日') }
+    ];
+    weekOptions.forEach(function(w) {
+        var opt = E('option', { value: w.value }, w.label); // ★ 移除 selected
+        weekSelect.appendChild(opt);
+    });
+    weekSelect.value = config.week; // ★ 强制设置
+    groupWeek.appendChild(weekSelect);
+    formBox.appendChild(groupWeek);
+
+    // 动态字段渲染
+    function renderDynamicFields(mode) {
+        dynamicContainer.innerHTML = '';
+        var curMode = mode || document.getElementById('edit-time_mode').value;
+
+        if (curMode === 'period' || curMode === 'combined') {
+            var gStart = E('div', { class: 'form-group' });
+            gStart.appendChild(E('label', {}, _('允许开始时间')));
+            gStart.appendChild(E('input', { id: 'edit-timestart', type: 'text', value: config.timestart || '00:00', placeholder: 'HH:MM' }));
+            dynamicContainer.appendChild(gStart);
+
+            var gEnd = E('div', { class: 'form-group' });
+            gEnd.appendChild(E('label', {}, _('允许结束时间')));
+            gEnd.appendChild(E('input', { id: 'edit-timeend', type: 'text', value: config.timeend || '00:00', placeholder: 'HH:MM' }));
+            dynamicContainer.appendChild(gEnd);
+        }
+
+        if (curMode === 'duration' || curMode === 'combined') {
+            var gDur = E('div', { class: 'form-group' });
+            gDur.appendChild(E('label', {}, _('允许时长 (分钟)')));
+            gDur.appendChild(E('input', { id: 'edit-duration', type: 'number', value: config.duration || '60', min: 1 }));
+            dynamicContainer.appendChild(gDur);
+        }
+
+        if (curMode === 'combined') {
+            var gUseDur = E('div', { class: 'form-group' });
+            gUseDur.appendChild(E('label', {}, _('在时段内启用时长限制')));
+            var useDurSelect = E('select', { id: 'edit-use_duration' });
+            useDurSelect.appendChild(E('option', { value: '1', selected: config.use_duration === '1' }, _('是')));
+            useDurSelect.appendChild(E('option', { value: '0', selected: config.use_duration === '0' }, _('否')));
+            gUseDur.appendChild(useDurSelect);
+            dynamicContainer.appendChild(gUseDur);
+        }
+
+        if (curMode === 'duration' || curMode === 'combined' || curMode === 'multi_period') {
+            // ★★★ 重置周期（修复：移除 selected，使用 value） ★★★
+            var gReset = E('div', { class: 'form-group' });
+            gReset.appendChild(E('label', {}, _('重置周期')));
+            var resetSelect = E('select', { id: 'edit-reset_cycle' });
+            var resetOptions = [
+                { value: 'daily', label: _('每日重置') },
+                { value: 'weekly', label: _('每周重置') },
+                { value: 'monthly', label: _('每月重置') },
+                { value: 'never', label: _('永不重置 (手动)') }
+            ];
+            resetOptions.forEach(function(r) {
+                var opt = E('option', { value: r.value }, r.label); // ★ 移除 selected
+                resetSelect.appendChild(opt);
+            });
+            resetSelect.value = config.reset_cycle; // ★ 强制设置
+            gReset.appendChild(resetSelect);
+            dynamicContainer.appendChild(gReset);
+        }
+
+        if (curMode === 'multi_period') {
+            var help = E('div', { class: 'help-text' }, _('每个时段可独立设置开始/结束时间和允许时长，时段之间互不影响。'));
+            dynamicContainer.appendChild(help);
+
+            for (var p = 1; p <= 3; p++) {
+                var prefix = 'period' + p;
+                var periodGroup = E('div', { class: 'period-group' });
+                var pTitle = E('div', { style: 'font-weight:bold;margin-bottom:4px;' }, _('时段 %d').format(p));
+                periodGroup.appendChild(pTitle);
+
+                var row1 = E('div', { class: 'form-group' });
+                row1.appendChild(E('label', { style: 'width:80px;' }, _('开始')));
+                row1.appendChild(E('input', { id: 'edit-' + prefix + '_start', type: 'text', value: config[prefix + '_start'] || '00:00', placeholder: 'HH:MM', style: 'flex:1;' }));
+                periodGroup.appendChild(row1);
+
+                var row2 = E('div', { class: 'form-group' });
+                row2.appendChild(E('label', { style: 'width:80px;' }, _('结束')));
+                row2.appendChild(E('input', { id: 'edit-' + prefix + '_end', type: 'text', value: config[prefix + '_end'] || '00:00', placeholder: 'HH:MM', style: 'flex:1;' }));
+                periodGroup.appendChild(row2);
+
+                var row3 = E('div', { class: 'form-group' });
+                row3.appendChild(E('label', { style: 'width:80px;' }, _('时长(分钟)')));
+                row3.appendChild(E('input', { id: 'edit-' + prefix + '_duration', type: 'number', value: config[prefix + '_duration'] || '60', min: 1, style: 'flex:1;' }));
+                periodGroup.appendChild(row3);
+
+                dynamicContainer.appendChild(periodGroup);
+            }
         }
     }
-});
 
+    renderDynamicFields(config.time_mode);
+    modeSelect.addEventListener('change', function(ev) {
+        renderDynamicFields(ev.target.value);
+    });
+
+    modal.appendChild(formBox);
+
+    // 按钮
+    var actions = E('div', { class: 'form-actions' });
+    var cancelBtn = E('button', {
+        class: 'tc-btn tc-btn-cancel',
+        click: function() { document.body.removeChild(overlay); }
+    }, _('取消'));
+    actions.appendChild(cancelBtn);
+
+    var saveBtn = E('button', {
+        class: 'tc-btn tc-btn-save',
+        click: function() {
+            var newData = {};
+            newData.comment = document.getElementById('edit-comment').value.trim();
+            newData.enable = document.getElementById('edit-enable').value;
+            newData.mac = document.getElementById('edit-mac').value.trim();
+            newData.time_mode = document.getElementById('edit-time_mode').value;
+            newData.week = document.getElementById('edit-week').value;
+
+            var mode = newData.time_mode;
+            if (mode === 'period' || mode === 'combined') {
+                newData.timestart = document.getElementById('edit-timestart') ? document.getElementById('edit-timestart').value : '';
+                newData.timeend = document.getElementById('edit-timeend') ? document.getElementById('edit-timeend').value : '';
+            }
+            if (mode === 'duration' || mode === 'combined') {
+                newData.duration = document.getElementById('edit-duration') ? document.getElementById('edit-duration').value : '';
+            }
+            if (mode === 'combined') {
+                newData.use_duration = document.getElementById('edit-use_duration') ? document.getElementById('edit-use_duration').value : '0';
+            }
+            if (mode === 'duration' || mode === 'combined' || mode === 'multi_period') {
+                newData.reset_cycle = document.getElementById('edit-reset_cycle') ? document.getElementById('edit-reset_cycle').value : 'daily';
+            }
+            if (mode === 'multi_period') {
+                for (var p = 1; p <= 3; p++) {
+                    var prefix = 'period' + p;
+                    newData[prefix + '_start'] = document.getElementById('edit-' + prefix + '_start') ? document.getElementById('edit-' + prefix + '_start').value : '';
+                    newData[prefix + '_end'] = document.getElementById('edit-' + prefix + '_end') ? document.getElementById('edit-' + prefix + '_end').value : '';
+                    newData[prefix + '_duration'] = document.getElementById('edit-' + prefix + '_duration') ? document.getElementById('edit-' + prefix + '_duration').value : '';
+                }
+            }
+
+            if (!newData.mac) {
+                showTip(_('请输入 IP/MAC 地址'), 'error');
+                return;
+            }
+            var existing = getDeviceList().filter(function(d) {
+                if (isEdit && d['.name'] === sectionId) return false;
+                return d.mac === newData.mac;
+            });
+            if (existing.length > 0) {
+                showTip(_('该 MAC/IP 已被其他设备使用'), 'error');
+                return;
+            }
+
+            saveBtn.disabled = true;
+            saveBtn.textContent = _('保存中...');
+
+            saveDevice(sectionId, newData).then(function() {
+                showTip(_('保存成功，页面即将刷新'), 'info');
+                document.body.removeChild(overlay);
+                setTimeout(function() { location.reload(); }, 1000);
+            }).catch(function(e) {
+                showTip(_('保存失败：') + e.message, 'error');
+                saveBtn.disabled = false;
+                saveBtn.textContent = _('保存');
+            });
+        }
+    }, _('保存'));
+    actions.appendChild(saveBtn);
+
+    modal.appendChild(actions);
+    overlay.appendChild(modal);
+
+    overlay.addEventListener('click', function(ev) {
+        if (ev.target === overlay) {
+            document.body.removeChild(overlay);
+        }
+    });
+
+    document.body.appendChild(overlay);
+}
+
+// ===== 主视图 =====
 return view.extend({
     load: function() {
-        return Promise.all([
-            uci.load('timecontrol'),
-            network.getHostHints()
-        ]);
+        debugLog('初始化配置并加载数据...');
+        return ensureGlobalSection().then(function() {
+            return Promise.all([
+                uci.load('timecontrol'),
+                network.getHostHints()
+            ]);
+        });
     },
     render: function(data) {
-        var m, s, o;
-        // 修复可选链语法
-        let hosts = data[1] && data[1].hosts;
+        debugLog('开始渲染自定义界面...');
+        var hosts = data[1] && data[1].hosts;
+        var devices = getDeviceList();
 
-        m = new form.Map('timecontrol', _('Internet Time Control'),
-            _('Users can limit their internet usage time through MAC and IP, with available IP ranges such as 192.168.110.00 to 192.168.10.200') + '<br/>' +
-            _('控制方式:') + '<br/>' +
-            _('1. 时间段控制: 指定的机器在设定时间段内可以上网，其他时间不能上网') + '<br/>' +
-            _('2. 允许上机时长: 指定的机器上线后可以上网指定时长，超过时长后不能上网') + '<br/>' +
-            _('3. 组合控制: 在时间段内+时长限制（在允许的时间段内限制上网时长）') + '<br/>' +
-            _('4. 多时段控制: 最多设置3个独立时间段，每个时段分别限制时长') + '<br/>' +
-            _('Suggested feedback:') + ' <a href="https://github.com/sirpdboy/luci-app-timecontrol.git" target="_blank">GitHub @timecontrol</a>');
+        var container = E('div', { class: 'tc-container' });
 
-        // 服务状态显示
-        s = m.section(form.TypedSection);
-        s.anonymous = true;
-        s.render = function() {
-            var statusView = E('p', { id: 'service_status' },
-                '<span class="spinning"> </span> ' + _('Checking service status...'));
-            checkTimeControlProcess()
-                .then(function(res) {
-                    var status = renderServiceStatus(res.running, res.pid);
-                    statusView.innerHTML = status;
+        // 版本提示
+        container.appendChild(E('div', { id: 'version-tip' }, [
+            E('strong', {}, '上网时间控制 - 修复版 ' + VERSION),
+            E('br'),
+            E('small', {}, '修复模态框下拉显示不一致')
+        ]));
+
+        // 服务状态
+        var statusDiv = E('div', { class: 'tc-status' }, _('检查服务状态...'));
+        container.appendChild(statusDiv);
+        function updateStatus() {
+            checkTimeControlProcess().then(function(res) {
+                var statusText = res.running ? _('运行中') : _('未运行');
+                var color = res.running ? 'green' : 'red';
+                statusDiv.innerHTML = '<span style="color:' + color + ';font-weight:bold;">' + statusText + '</span>' +
+                    (res.pid ? ' (PID: ' + res.pid + ')' : '');
+            }).catch(function() {
+                statusDiv.innerHTML = '<span style="color:orange;">⚠ ' + _('状态检查失败') + '</span>';
+            });
+        }
+        updateStatus();
+        poll.add(updateStatus, 5);
+
+        // ===== 全局设置（白名单禁用） =====
+        var globalSettings = E('div', { class: 'tc-global-settings' });
+
+        var listType = getGlobalSetting('list_type', 'blacklist');
+        var listGroup = E('span', {});
+        listGroup.appendChild(E('label', {}, _('控制模式')));
+        var listSelect = E('select', { id: 'global-list-type' });
+        listSelect.appendChild(E('option', { value: 'blacklist' }, _('黑名单')));
+        listSelect.appendChild(E('option', { value: 'whitelist', disabled: true }, _('白名单')));
+        listSelect.value = listType;
+        listSelect.addEventListener('change', function() {
+            var val = this.value;
+            listSelect.disabled = true;
+            setGlobalSetting('list_type', val)
+                .then(function() {
+                    debugLog('控制模式已保存到配置文件');
                 })
                 .catch(function(err) {
-                    statusView.innerHTML = '<span style="color:orange">⚠ ' +
-                        _('Status check failed') + '</span>';
-                    console.error('Status check error:', err);
+                    showTip(_('保存失败：') + err.message, 'error');
+                })
+                .finally(function() {
+                    listSelect.disabled = false;
                 });
-            poll.add(function() {
-                return checkTimeControlProcess()
-                    .then(function(res) {
-                        var status = renderServiceStatus(res.running, res.pid);
-                        statusView.innerHTML = status;
-                    })
-                    .catch(function(err) {
-                        statusView.innerHTML = '<span style="color:orange">⚠ ' +
-                            _('Status check failed') + '</span>';
-                        console.error('Status check error:', err);
-                    });
-            }, 5);
-            poll.start();
-            return E('div', { class: 'cbi-section', id: 'status_bar' }, [
-                statusView,
-                E('div', { 'style': 'text-align: right; font-style: italic;' }, [
-                    E('span', {}, [
-                        _('© github '),
-                        E('a', {
-                            'href': 'https://github.com/sirpdboy',
-                            'target': '_blank',
-                            'style': 'text-decoration: none;'
-                        }, 'by sirpdboy')
-                    ])
-                ])
-            ]);
-        };
+        });
+        listGroup.appendChild(listSelect);
+        globalSettings.appendChild(listGroup);
 
-        // 全局控制设置
-        s = m.section(form.TypedSection, 'timecontrol');
-        s.anonymous = true;
-        s.addremove = false;
-
-        o = s.option(cbiRichListValue, 'list_type', _('Control Mode'),
-            _('blacklist: Block the networking of the target address, whitelist: Only allow networking for the target address and block all other addresses.'));
-        o.rmempty = false;
-        o.value('blacklist', _('Blacklist'));
-        // o.value('whitelist', _('Whitelist'));
-        o.default = 'blacklist';
-
-        o = s.option(cbiRichListValue, 'chain', _('Control Intensity'),
-            _('Pay attention to strong control: machines under control will not be able to connect to the software router backend!'));
-        o.value('forward', _('Ordinary forward control'));
-        o.value('input', _('Strong input control'));
-        o.default = 'forward';
-        o.rmempty = false;
-
-        // 设备规则表
-        var s = m.section(form.TableSection, 'device', _('Device Rules'));
-        s.addremove = true;
-        s.anonymous = true;
-        s.sortable = false;
-        s.id = 'device-table';
-
-        // ===== 自定义列：已用时长 =====
-        var usageCol = s.option(form.DummyValue, 'usage', _('Used Time (min)'));
-        usageCol.rawhtml = true;
-        usageCol.render = function(section_id) {
-            return E('span', { 'class': 'usage-display', 'data-id': section_id }, _('--'));
-        };
-
-        o = s.option(form.Value, 'comment', _('Comment'));
-        o.optional = true;
-        o.placeholder = _('Description');
-
-        o = s.option(form.Flag, 'enable', _('Enabled'));
-        o.rmempty = false;
-        o.default = '1';
-
-        o = s.option(form.Value, 'mac', _('IP/MAC Address'));
-        o.rmempty = false;
-        if (hosts) {
-            var hostOptions = {};
-            Object.keys(hosts).forEach(function(mac) {
-                var host = hosts[mac];
-                var name = host.name || _(' ');
-                var ips = L.toArray(host.ipaddrs || host.ipv4 || []);
-                if (ips.length > 0) {
-                    ips.forEach(function(ip) {
-                        var macDisplay = 'MAC: %s (%s - %s)'.format(mac, ip, name);
-                        hostOptions['mac:' + mac] = macDisplay;
-                        var ipDisplay = 'IP: %s (%s - %s)'.format(ip, mac, name);
-                        hostOptions['ip:' + ip] = ipDisplay;
-                    });
-                }
-            });
-            var sortedKeys = Object.keys(hostOptions).sort(function(a, b) {
-                return hostOptions[a].localeCompare(hostOptions[b]);
-            });
-            sortedKeys.forEach(function(key) {
-                if (key.startsWith('ip:')) {
-                    o.value(key.substring(3), hostOptions[key]);
-                }
-            });
-            sortedKeys.forEach(function(key) {
-                if (key.startsWith('mac:')) {
-                    o.value(key.substring(4), hostOptions[key]);
-                }
-            });
-        }
-
-        // 时间控制模式
-        o = s.option(cbiRichListValue, 'time_mode', _('Time Control Mode'));
-        o.value('period', _('Time Period Control (allow in period)'));
-        o.value('duration', _('Allow Duration Control (allow limited time)'));
-        o.value('combined', _('Combined Control (allow in period + limit duration)'));
-        o.value('multi_period', _('Multi-Period Control (up to 3 periods)'));
-        o.default = 'period';
-        o.rmempty = false;
-
-        o.onchange = function(ev, mode) {
-            var row = this.map.findElement('id', this.cbid(this.section_id));
-            if (row) {
-                var startTime = row.querySelector('[data-field="timestart"]');
-                var endTime = row.querySelector('[data-field="timeend"]');
-                var duration = row.querySelector('[data-field="duration"]');
-                var useDuration = row.querySelector('[data-field="use_duration"]');
-                var resetCycle = row.querySelector('[data-field="reset_cycle"]');
-
-                var periodFields = [];
-                for (var i = 1; i <= 3; i++) {
-                    periodFields.push({
-                        start: row.querySelector('[data-field="period' + i + '_start"]'),
-                        end: row.querySelector('[data-field="period' + i + '_end"]'),
-                        dur: row.querySelector('[data-field="period' + i + '_duration"]')
-                    });
-                }
-
-                var isMulti = (mode === 'multi_period');
-
-                if (startTime) startTime.parentElement.style.display =
-                    (mode === 'period' || mode === 'combined') ? '' : 'none';
-                if (endTime) endTime.parentElement.style.display =
-                    (mode === 'period' || mode === 'combined') ? '' : 'none';
-                if (duration) duration.parentElement.style.display =
-                    (mode === 'duration' || mode === 'combined') ? '' : 'none';
-                if (useDuration) useDuration.parentElement.style.display =
-                    (mode === 'combined') ? '' : 'none';
-                if (resetCycle) resetCycle.parentElement.style.display =
-                    (mode === 'duration' || mode === 'combined' || isMulti) ? '' : 'none';
-
-                periodFields.forEach(function(pf) {
-                    if (pf.start) pf.start.parentElement.style.display = isMulti ? '' : 'none';
-                    if (pf.end) pf.end.parentElement.style.display = isMulti ? '' : 'none';
-                    if (pf.dur) pf.dur.parentElement.style.display = isMulti ? '' : 'none';
+        var chainType = getGlobalSetting('chain', 'forward');
+        var chainGroup = E('span', {});
+        chainGroup.appendChild(E('label', {}, _('拦截强度')));
+        var chainSelect = E('select', { id: 'global-chain' });
+        chainSelect.appendChild(E('option', { value: 'forward' }, _('普通转发控制')));
+        chainSelect.appendChild(E('option', { value: 'input' }, _('强控制（阻断本机访问）')));
+        chainSelect.value = chainType;
+        chainSelect.addEventListener('change', function() {
+            var val = this.value;
+            chainSelect.disabled = true;
+            setGlobalSetting('chain', val)
+                .then(function() {
+                    debugLog('拦截强度已保存到配置文件');
+                })
+                .catch(function(err) {
+                    showTip(_('保存失败：') + err.message, 'error');
+                })
+                .finally(function() {
+                    chainSelect.disabled = false;
                 });
+        });
+        chainGroup.appendChild(chainSelect);
+        globalSettings.appendChild(chainGroup);
+
+        container.appendChild(globalSettings);
+
+        // ===== 添加设备按钮 =====
+        var addBar = E('div', { class: 'tc-add-bar' });
+        var addBtn = E('button', {
+            class: 'tc-btn tc-btn-add',
+            click: function() {
+                buildModal(_('添加设备'), null, hosts);
             }
-        };
+        }, _('添加设备'));
+        addBar.appendChild(addBtn);
+        container.appendChild(addBar);
 
-        // 单时段字段
-        o = s.option(form.Value, 'timestart', _('Allow Start Time'));
-        o.placeholder = '00:00';
-        o.default = '00:00';
-        o.depends({ 'time_mode': 'period', '!contains': true });
-        o.depends({ 'time_mode': 'combined', '!contains': true });
+        // ===== 设备表格 =====
+        var tableWrap = E('div', { class: 'tc-table-wrap' });
+        var table = E('table', { class: 'tc-table' });
 
-        o = s.option(form.Value, 'timeend', _('Allow End Time'));
-        o.placeholder = '00:00';
-        o.default = '00:00';
-        o.depends({ 'time_mode': 'period', '!contains': true });
-        o.depends({ 'time_mode': 'combined', '!contains': true });
+        var thead = E('thead', {}, [
+            E('tr', {}, [
+                E('th', { 'data-field': 'comment' }, _('备注')),
+                E('th', { 'data-field': 'enable' }, _('启用')),
+                E('th', { 'data-field': 'mac' }, _('IP/MAC')),
+                E('th', { 'data-field': 'time_mode' }, _('控制模式')),
+                E('th', { 'data-field': 'timestart' }, _('开始时间')),
+                E('th', { 'data-field': 'timeend' }, _('结束时间')),
+                E('th', { 'data-field': 'duration' }, _('时长(分钟)')),
+                E('th', { 'data-field': 'period_detail' }, _('时段详情')),
+                E('th', { 'data-field': 'usage' }, _('已用时长')),
+                E('th', { 'class': 'actions-cell' }, _('操作'))
+            ])
+        ]);
+        table.appendChild(thead);
 
-        o = s.option(form.Value, 'duration', _('Allowed Duration (minutes)'));
-        o.placeholder = '60';
-        o.default = '60';
-        o.datatype = 'min(1)';
-        o.depends({ 'time_mode': 'duration', '!contains': true });
-        o.depends({ 'time_mode': 'combined', '!contains': true });
-        o.description = _('设备上线后允许上网的分钟数，超过后将被禁止上网');
+        var tbody = E('tbody');
+        if (devices.length === 0) {
+            tbody.appendChild(E('tr', {}, [
+                E('td', { colspan: 10, class: 'tc-empty' }, _('暂无设备规则，请添加'))
+            ]));
+        } else {
+            devices.forEach(function(dev) {
+                var id = dev['.name'];
+                var tr = E('tr', { 'data-id': id });
 
-        o = s.option(form.Flag, 'use_duration', _('Enable Duration Limit in Period'));
-        o.default = '0';
-        o.depends({ 'time_mode': 'combined', '!contains': true });
-        o.description = _('在允许的时间段内限制上网时长');
+                tr.appendChild(E('td', { class: 'comment-cell' }, dev.comment || ''));
+                tr.appendChild(E('td', {}, dev.enable === '1' ? _('是') : _('否')));
+                tr.appendChild(E('td', { class: 'mac-cell' }, dev.mac || ''));
+                var modeMap = {
+                    'period': _('时间段'),
+                    'duration': _('时长'),
+                    'combined': _('组合'),
+                    'multi_period': _('多时段')
+                };
+                tr.appendChild(E('td', { class: 'mode-cell' }, modeMap[dev.time_mode] || dev.time_mode));
+                tr.appendChild(E('td', {}, dev.timestart || ''));
+                tr.appendChild(E('td', {}, dev.timeend || ''));
+                tr.appendChild(E('td', { class: 'duration-cell' }, dev.duration || ''));
 
-        // 多时段字段
-        for (var p = 1; p <= 3; p++) {
-            var prefix = 'period' + p;
-            var startOpt = s.option(form.Value, prefix + '_start', _('Period %d Start Time').format(p));
-            startOpt.placeholder = '00:00';
-            startOpt.default = '00:00';
-            startOpt.depends({ 'time_mode': 'multi_period' });
+                var detailText = '';
+                if (dev.time_mode === 'multi_period') {
+                    var details = [];
+                    for (var p = 1; p <= 3; p++) {
+                        var start = dev['period' + p + '_start'] || '';
+                        var end = dev['period' + p + '_end'] || '';
+                        var dur = dev['period' + p + '_duration'] || '';
+                        if (start && end && dur) {
+                            details.push(_('时段%s: %s-%s(%s分钟)').format(p, start, end, dur));
+                        }
+                    }
+                    detailText = details.join('; ');
+                } else {
+                    detailText = _('单时段');
+                }
+                tr.appendChild(E('td', { class: 'period-detail-cell' }, detailText));
 
-            var endOpt = s.option(form.Value, prefix + '_end', _('Period %d End Time').format(p));
-            endOpt.placeholder = '00:00';
-            endOpt.default = '00:00';
-            endOpt.depends({ 'time_mode': 'multi_period' });
+                var usageSpan = E('span', { class: 'usage-display', 'data-id': id }, _('--'));
+                tr.appendChild(E('td', { class: 'usage-cell' }, usageSpan));
 
-            var durOpt = s.option(form.Value, prefix + '_duration', _('Period %d Duration (minutes)').format(p));
-            durOpt.placeholder = '60';
-            durOpt.default = '60';
-            durOpt.datatype = 'min(1)';
-            durOpt.depends({ 'time_mode': 'multi_period' });
-            durOpt.description = _('该时段内允许上网的分钟数');
+                var actionsTd = E('td', { class: 'actions-cell' });
+                // 编辑按钮
+                var editBtn = E('button', {
+                    class: 'tc-btn tc-btn-edit',
+                    click: function(ev) {
+                        ev.preventDefault();
+                        var devData = getDeviceById(id);
+                        if (devData) {
+                            buildModal(_('编辑设备'), devData, hosts);
+                        } else {
+                            showTip(_('设备数据不存在'), 'error');
+                        }
+                    }
+                }, _('编辑'));
+                actionsTd.appendChild(editBtn);
+
+                // 重置按钮
+                var resetBtn = E('button', {
+                    class: 'tc-btn tc-btn-reset',
+                    click: function(ev) {
+                        ev.preventDefault();
+                        if (confirm(_('确定要重置该设备的时间限制吗？'))) {
+                            resetDevice(id).then(function() {
+                                showTip(_('重置成功，将在下一分钟生效'), 'info');
+                                getDeviceUsage(id).then(function(output) {
+                                    var span = document.querySelector('.usage-display[data-id="' + id + '"]');
+                                    if (span) {
+                                        var parts = output.split(',');
+                                        var display = parts.map(function(p) {
+                                            var kv = p.split(':');
+                                            return kv.length === 2 ? _('时段%s: %s分钟').format(kv[0], kv[1]) : p;
+                                        }).join(' | ');
+                                        span.textContent = display;
+                                    }
+                                });
+                            }).catch(function(err) {
+                                showTip(_('重置失败: ') + err, 'error');
+                            });
+                        }
+                    }
+                }, _('重置'));
+                actionsTd.appendChild(resetBtn);
+
+                // 删除按钮
+                var delBtn = E('button', {
+                    class: 'tc-btn tc-btn-del',
+                    click: function(ev) {
+                        ev.preventDefault();
+                        if (!confirm(_('确定要删除该设备规则吗？'))) return;
+                        delBtn.disabled = true;
+                        delBtn.textContent = _('删除中...');
+                        deleteDevice(id)
+                            .then(function() {
+                                setTimeout(function() { location.reload(); }, 1500);
+                            })
+                            .catch(function() {
+                                delBtn.disabled = false;
+                                delBtn.textContent = _('删除');
+                            });
+                    }
+                }, _('删除'));
+                actionsTd.appendChild(delBtn);
+
+                tr.appendChild(actionsTd);
+                tbody.appendChild(tr);
+            });
+        }
+        table.appendChild(tbody);
+        tableWrap.appendChild(table);
+        container.appendChild(tableWrap);
+
+        // ===== 轮询更新已用时长 =====
+        function updateAllUsage() {
+            var spans = document.querySelectorAll('.usage-display');
+            spans.forEach(function(span) {
+                var id = span.dataset.id;
+                if (id) {
+                    getDeviceUsage(id).then(function(output) {
+                        var parts = output.split(',');
+                        var display = parts.map(function(p) {
+                            var kv = p.split(':');
+                            return kv.length === 2 ? _('时段%s: %s分钟').format(kv[0], kv[1]) : p;
+                        }).join(' | ');
+                        span.textContent = display;
+                    }).catch(function() {});
+                }
+            });
         }
 
-        // 重置周期
-        o = s.option(cbiRichListValue, 'reset_cycle', _('Reset Cycle'));
-        o.value('daily', _('Daily Reset'));
-        o.value('weekly', _('Weekly Reset'));
-        o.value('monthly', _('Monthly Reset'));
-        o.value('never', _('Never Reset (until manual reset)'));
-        o.default = 'daily';
-        o.depends({ 'time_mode': 'duration', '!contains': true });
-        o.depends({ 'time_mode': 'combined', '!contains': true });
-        o.depends({ 'time_mode': 'multi_period', '!contains': true });
-        o.description = _('时长重置周期');
+        setTimeout(updateAllUsage, 500);
+        poll.add(function() {
+            updateAllUsage();
+        }, 10);
 
-        // 星期
-        o = s.option(form.Value, 'week', _('Week Day (1~7)'));
-        o.value('0', _('Everyday'));
-        o.value('1', _('Monday'));
-        o.value('2', _('Tuesday'));
-        o.value('3', _('Wednesday'));
-        o.value('4', _('Thursday'));
-        o.value('5', _('Friday'));
-        o.value('6', _('Saturday'));
-        o.value('7', _('Sunday'));
-        o.value('1,2,3,4,5', _('Workday'));
-        o.value('6,7', _('Rest Day'));
-        o.default = '0';
-        o.rmempty = false;
-        o.description = _('允许上网的星期');
-
-        // ===== 自定义渲染：添加重置按钮和已用时长轮询 =====
-        // 保存原始render，但我们直接重写
-        var origRender = s.render;
-        s.render = function() {
-            var result = origRender.call(this);
-            // 延迟执行DOM操作
-            setTimeout(function() {
-                var rows = document.querySelectorAll('#device-table tbody tr');
-                rows.forEach(function(row) {
-                    var id = row.dataset.section;
-                    if (!id) return;
-                    var actionsCell = row.querySelector('.cbi-section-actions');
-                    if (!actionsCell) return;
-                    
-                    // 添加重置按钮（避免重复）
-                    if (!actionsCell.querySelector('.cbi-button-reset')) {
-                        var btn = E('button', {
-                            'class': 'cbi-button cbi-button-reset',
-                            'click': function(ev) {
-                                ev.preventDefault();
-                                if (confirm(_('Are you sure you want to reset the time limit for this device?'))) {
-                                    fs.exec_direct('/usr/bin/timecontrol', ['reset', id])
-                                        .then(function() {
-                                            ui.addNotification(null, E('p', _('Reset successful, will take effect in next minute')), 'info');
-                                            location.reload();
-                                        })
-                                        .catch(function(err) {
-                                            ui.addNotification(null, E('p', _('Reset failed: %s').format(err)), 'error');
-                                        });
-                                }
-                            }
-                        }, _('Reset Time'));
-                        actionsCell.appendChild(btn);
-                    }
-                });
-
-                // 启动已用时长轮询
-                poll.add(function() {
-                    var sections = uci.sections('timecontrol', 'device');
-                    sections.forEach(function(s) {
-                        var id = s['.name'];
-                        if (!id) return;
-                        fs.exec_direct('/usr/bin/timecontrol', ['getusage', id, 'all'])
-                            .then(function(res) {
-                                var output = res.trim();
-                                var span = document.querySelector('.usage-display[data-id="' + id + '"]');
-                                if (span) {
-                                    // output 格式 "1:5,2:10,3:0"
-                                    var parts = output.split(',');
-                                    var display = parts.map(function(p) {
-                                        var kv = p.split(':');
-                                        if (kv.length === 2) {
-                                            return _('P%s: %s min').format(kv[0], kv[1]);
-                                        }
-                                        return p;
-                                    }).join(' | ');
-                                    span.textContent = display;
-                                }
-                            })
-                            .catch(function(err) {
-                                // 忽略错误，保留显示不变
-                            });
-                    });
-                }, 10); // 10秒刷新
-
-            }, 100);
-            return result;
-        };
-
-        return m.render();
+        return E('div', { class: 'cbi-map' }, [container]);
     }
 });
