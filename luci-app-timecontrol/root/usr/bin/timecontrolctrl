@@ -3,6 +3,9 @@
 # Copyright (C) 2006 OpenWrt.org
 # Copyright 2022-2026 sirpdboy <herboy2008@gmail.com>
 #
+# 版本：v3.3.20-fix-first-delta
+# 修复：第一次检测时增量不为0的问题；统一日志单位显示
+#
 # 适配 ImmortalWrt 25.12 修复：
 # 1. config_t_get 中 ${ret:=${4}} -> ${ret:-${4}}
 # 2. 所有 eq 比较改为 -eq
@@ -10,6 +13,7 @@
 # 4. 时长重置改用 date +%Y%m%d / %Y%W / %Y%m 直接比较，避免 date -d
 # 5. 变量引用添加双引号避免分词
 # 6. 新增：流量感知计时（需 bandix 插件支持），兼容 4 种模式
+# 7. 使用 t_rx_b + t_tx_b 计算增量，日志打印 l_rx_b/l_tx_b
 
 NAME=timecontrol
 LOG_FILE="/var/log/timecontrol.log"
@@ -248,36 +252,60 @@ read_traffic_config() {
     export TRAFFIC_ENABLED TRAFFIC_THRESHOLD_KB TRAFFIC_CONSECUTIVE TRAFFIC_POLL_INTERVAL
 }
 
-get_device_traffic_total() {
+# ★★★ 获取设备完整数据（MAC 转换使用兼容写法） ★★★
+get_device_traffic_data() {
     local mac="$1"
-    [ -z "$mac" ] && echo "0" && return 1
-    local mac_lower=$(echo "$mac" | tr '[:upper:]' '[:lower:]')
-    local total=$(ubus call luci.bandix getStatus 2>/dev/null | jq -r ".d[] | select(.mac == \"$mac_lower\") | (.t_rx_b // 0) + (.t_tx_b // 0)")
-    [ -z "$total" ] || [ "$total" = "null" ] && echo "0" || echo "$total"
+    [ -z "$mac" ] && echo "0|0|0|0" && return 1
+    local mac_lower=$(echo "$mac" | tr '[A-Z]' '[a-z]')
+    local json=$(ubus call luci.bandix getStatus 2>/dev/null)
+    local total=$(echo "$json" | jq -r ".d[] | select(.mac == \"$mac_lower\") | (.t_rx_b // 0) + (.t_tx_b // 0)")
+    local l_rx=$(echo "$json" | jq -r ".d[] | select(.mac == \"$mac_lower\") | .l_rx_b // 0")
+    local l_tx=$(echo "$json" | jq -r ".d[] | select(.mac == \"$mac_lower\") | .l_tx_b // 0")
+    [ -z "$total" ] || [ "$total" = "null" ] && total=0
+    [ -z "$l_rx" ] || [ "$l_rx" = "null" ] && l_rx=0
+    [ -z "$l_tx" ] || [ "$l_tx" = "null" ] && l_tx=0
+    echo "$total|$l_rx|$l_tx"
 }
 
+# ★★★ 更新流量状态（修复第一次增量不为0问题） ★★★
 update_traffic_state() {
     local mac="$1"
-    local state_file="$TRAFFIC_STATE_DIR/$(echo "$mac" | tr '[:upper:]' '[:lower:]').state"
-    local current_total=$(get_device_traffic_total "$mac")
+    local state_file="$TRAFFIC_STATE_DIR/$(echo "$mac" | tr '[A-Z]' '[a-z]').state"
+    local data=$(get_device_traffic_data "$mac")
+    local current_total=$(echo "$data" | cut -d'|' -f1)
+    local l_rx=$(echo "$data" | cut -d'|' -f2)
+    local l_tx=$(echo "$data" | cut -d'|' -f3)
     local last_total=0
     local consecutive=0
+
+    # 读取旧状态
     if [ -f "$state_file" ]; then
         local old_data=$(cat "$state_file")
         last_total=$(echo "$old_data" | cut -d'|' -f1)
         consecutive=$(echo "$old_data" | cut -d'|' -f2)
         [ -z "$last_total" ] && last_total=0
         [ -z "$consecutive" ] && consecutive=0
+    else
+        # ★ 第一次运行：直接将当前累计值作为上次值，避免产生巨大增量
+        last_total=$current_total
+        consecutive=0
     fi
+
     local delta=$((current_total - last_total))
     local threshold_bytes=$((TRAFFIC_THRESHOLD_KB * 1024))
-    dbg "流量检测: MAC=$mac, 增量=${delta}B, 阈值=${TRAFFIC_THRESHOLD_KB}KB, 连续次数=$consecutive"
+
+    # 日志中显示阈值同时带 KB 和 B
+    dbg "流量检测: MAC=$mac, 增量=${delta}B, 阈值=${TRAFFIC_THRESHOLD_KB}KB(${threshold_bytes}B), 连续次数=$consecutive, l_rx_b=$l_rx, l_tx_b=$l_tx"
+
     if [ "$delta" -gt "$threshold_bytes" ]; then
         consecutive=$((consecutive + 1))
     else
         consecutive=0
     fi
+
+    # 写入新状态（包括首次记录的 current_total）
     echo "${current_total}|${consecutive}" > "$state_file"
+
     if [ "$consecutive" -ge "$TRAFFIC_CONSECUTIVE" ]; then
         echo "1"
     else
@@ -372,7 +400,6 @@ check_device_control() {
                         return 1
                     else
                         dbg "时段$p 允许: $target"
-                        # 注意：这里不更新状态，由外部流量控制
                         return 0
                     fi
                 fi
@@ -417,7 +444,6 @@ update_device_status() {
                 echo "!$id!" >> "$IDLIST"
             fi
             info "阻止上网: $comment ($target)"
-            # 非多时段断开总时长（多时段需外部额外处理）
             record_connection_time "$target" "disconnect"
         fi
     fi
@@ -506,9 +532,7 @@ main_loop() {
                 fi
             else
                 # 流量感知未启用：采用原有逻辑（自动连接/断开）
-                # 注意：check_device_control 已不再自动修改状态，所以我们需要在这里补上
                 if [ "$time_mode" = "multi_period" ]; then
-                    # 多时段：直接允许所有当前时段（因为已通过检查，allow=0）
                     for p in 1 2 3; do
                         local start=$(config_t_get device "period${p}_start" "$id" "")
                         [ -z "$start" ] && continue
