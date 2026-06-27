@@ -2,39 +2,41 @@
 set -e
 
 REPO="kavass168/luci-app-timecontrol-25.12"
+TAG="main-luci-app-timecontrol"
 
-echo "正在获取最新 Release 信息..."
+echo "正在获取 Release 文件列表..."
+# 获取 Release 页面的 HTML，提取所有 .apk 文件名
+PAGE_URL="https://github.com/${REPO}/releases/tag/${TAG}"
+APK_NAMES=$(uclient-fetch -qO- "$PAGE_URL" 2>/dev/null | \
+    grep -o 'href="[^"]*\.apk"' | \
+    sed 's/href="\/[^\/]*\/[^\/]*\/releases\/download\/[^\/]*\///;s/"//' | \
+    sort -u)
 
-# 1. 获取最新 Release 的 API 响应
-API_URL="https://api.github.com/repos/${REPO}/releases/latest"
-JSON=$(uclient-fetch -qO- "$API_URL" 2>/dev/null)
-
-# 2. 提取所有 .apk 文件的下载 URL（用 grep/sed 代替 jq）
-#    格式： "browser_download_url": "https://..."
-APK_URLS=$(echo "$JSON" | grep -o '"browser_download_url": *"[^"]*\.apk"' | sed 's/.*"\([^"]*\)"/\1/')
-
-if [ -z "$APK_URLS" ]; then
-    echo "错误：未找到任何 .apk 文件，请检查仓库或 Release。"
+if [ -z "$APK_NAMES" ]; then
+    echo "错误：未找到任何 .apk 文件。"
+    echo "请检查 Release 页面：$PAGE_URL"
     exit 1
 fi
 
-# 3. 筛选出主包和语言包（按文件名匹配）
-MAIN_URL=$(echo "$APK_URLS" | grep 'luci-app-timecontrol-.*\.apk' | head -1)
-LANG_URL=$(echo "$APK_URLS" | grep 'luci-i18n-timecontrol-zh-cn-.*\.apk' | head -1)
+echo "找到以下 .apk 文件："
+echo "$APK_NAMES"
 
-if [ -z "$MAIN_URL" ] || [ -z "$LANG_URL" ]; then
+# 筛选主包和语言包
+MAIN_FILE=$(echo "$APK_NAMES" | grep '^luci-app-timecontrol-.*\.apk$' | head -1)
+LANG_FILE=$(echo "$APK_NAMES" | grep '^luci-i18n-timecontrol-zh-cn-.*\.apk$' | head -1)
+
+if [ -z "$MAIN_FILE" ] || [ -z "$LANG_FILE" ]; then
     echo "错误：未找到主包或语言包。"
-    echo "找到的 .apk 文件如下："
-    echo "$APK_URLS"
     exit 1
 fi
 
-echo "找到主包：$(basename "$MAIN_URL")"
-echo "找到语言包：$(basename "$LANG_URL")"
+BASE_URL="https://github.com/${REPO}/releases/download/${TAG}"
 
-echo "下载中..."
-uclient-fetch -qO /tmp/main.apk "$MAIN_URL"
-uclient-fetch -qO /tmp/lang.apk "$LANG_URL"
+echo "下载主包：$MAIN_FILE"
+uclient-fetch -qO /tmp/main.apk "$BASE_URL/$MAIN_FILE"
+
+echo "下载语言包：$LANG_FILE"
+uclient-fetch -qO /tmp/lang.apk "$BASE_URL/$LANG_FILE"
 
 echo "安装（跳过签名验证）..."
 apk add --allow-untrusted /tmp/main.apk /tmp/lang.apk
