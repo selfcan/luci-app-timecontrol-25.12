@@ -27,6 +27,7 @@ IDLIST="/var/$NAME.idlist"
 DURATION_DIR="/var/lib/timecontrol"
 DURATION_DB="$DURATION_DIR/duration.db"
 PERIOD_DURATION_DB="$DURATION_DIR/period_duration.db"
+TRAFFIC_STATE_DIR="$DURATION_DIR/traffic_state"
 
 bin_nft=$(which nft 2>/dev/null)
 [ -x "$bin_nft" ] || {
@@ -57,7 +58,7 @@ info() {
     echo "FW-INFO: $@"
 }
 
-# ---------- 地址解析 ----------
+# ---------- 地址解析（不变） ----------
 parse_target() {
     local target="$1"
     target=$(echo "${target}" | xargs)
@@ -352,7 +353,7 @@ EOF
     esac
 }
 
-# ===== 新增：手动重置设备时长 =====
+# ===== 新增：手动重置设备时长（增强版：清除流量状态文件） =====
 reset_device() {
     local id="$1"
     local period="${2:-all}"
@@ -364,6 +365,7 @@ reset_device() {
     
     info "手动重置设备 $target 的时长 (时段: $period)"
     mkdir -p "$DURATION_DIR"
+    mkdir -p "$TRAFFIC_STATE_DIR"
     
     if [ "$period" = "all" ]; then
         for p in 1 2 3; do
@@ -374,13 +376,16 @@ reset_device() {
         done
         sed -i "/^$target,/d" "$DURATION_DB" 2>/dev/null
         rm -f "$DURATION_DIR/last_reset_$target" 2>/dev/null
-        info "所有时段已重置"
+        # ★★★ 清除流量状态文件 ★★★
+        rm -f "$TRAFFIC_STATE_DIR/$(echo "$target" | tr '[:upper:]' '[:lower:]').state"
+        info "所有时段已重置，流量状态文件已清除"
     else
         if [ "$period" -ge 1 ] && [ "$period" -le 3 ]; then
             sed -i "/^$target,$period,/d" "$PERIOD_DURATION_DB" 2>/dev/null
             rm -f "$DURATION_DIR/last_reset_${target}_period${period}" 2>/dev/null
             echo "$target,$period,0,0,0" >> "$PERIOD_DURATION_DB"
-            info "时段$period 已重置"
+            rm -f "$TRAFFIC_STATE_DIR/$(echo "$target" | tr '[:upper:]' '[:lower:]').state"
+            info "时段$period 已重置，流量状态文件已清除"
         else
             echo "错误: 时段号必须为1-3或all"
             return 1
@@ -541,7 +546,7 @@ case "$crrun" in
         sed -i "/!$crid!/d" "$IDLIST" 2>/dev/null
         show_firewall_status
         ;;
-    "reset")   # 新增重置命令
+    "reset")
         [ -z "$crid" ] && {
             echo "错误: 需要指定设备ID"
             exit 1
@@ -549,7 +554,7 @@ case "$crrun" in
         local period="${3:-all}"
         reset_device "$crid" "$period"
         ;;
-    "getusage")   # 新增查询已用时长
+    "getusage")
         [ -z "$crid" ] && {
             echo "错误: 需要指定设备ID"
             exit 1
