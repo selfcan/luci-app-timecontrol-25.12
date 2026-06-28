@@ -122,4 +122,4 @@ jobs:
             编译完成，未测试！
             插件：${{ github.event.inputs.PLUGIN_NAME }}
             架构：${{ env.ARCH }}
-            编译时间：$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+            编译时间：$(TZ=UTC-8 date +"%y.%m.%d-%H.%M.%S")"
