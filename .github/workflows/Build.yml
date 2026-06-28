@@ -111,15 +111,18 @@ jobs:
           find ./bin/packages/${{ env.ARCH }}/ -type f -name "*.apk" -exec cp {} ./upload/ \;
           echo "已复制以下文件："
           ls -l ./upload/
-
+          
+      - name: Set build time
+        run: echo "BUILD_TIME=$(TZ=UTC-8 date +'%y.%m.%d-%H.%M.%S')" >> $GITHUB_ENV
+    
       # ---------- 发布到 Release ----------
       - name: Release Firmware
         uses: softprops/action-gh-release@master
         with:
-          tag_name: ${{ github.event.inputs.PLUGIN_NAME }}
+          tag_name: ${{ github.event.inputs.PLUGIN_NAME }}-${{ env.BUILD_TIME }}
           files: ${{ env.SDK_DIR }}/upload/*.apk
           body: |
             编译完成，未测试！
             插件：${{ github.event.inputs.PLUGIN_NAME }}
             架构：${{ env.ARCH }}
-            编译时间：$(TZ=UTC-8 date +"%y.%m.%d-%H.%M.%S")
+            编译时间：${{ env.BUILD_TIME }}
