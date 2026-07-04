@@ -3,8 +3,9 @@
 # Copyright (C) 2006 OpenWrt.org
 # Copyright 2022-2026 sirpdboy <herboy2008@gmail.com>
 #
-# 版本：v3.3.20-fix-first-delta
-# 修复：第一次检测时增量不为0的问题；统一日志单位显示
+# 版本：v3.4.0-scheduled-reset
+# 更新：新增定时重置功能（每日凌晨1:00统一重置），保留所有原有逻辑
+# 日期：2026-07-04
 #
 # 适配 ImmortalWrt 25.12 修复：
 # 1. config_t_get 中 ${ret:=${4}} -> ${ret:-${4}}
@@ -14,6 +15,7 @@
 # 5. 变量引用添加双引号避免分词
 # 6. 新增：流量感知计时（需 bandix 插件支持），兼容 4 种模式
 # 7. 使用 t_rx_b + t_tx_b 计算增量，日志打印 l_rx_b/l_tx_b
+# 8. 新增：每日凌晨1:00定时重置所有设备（可配置重置时间）
 
 NAME=timecontrol
 LOG_FILE="/var/log/timecontrol.log"
@@ -29,6 +31,7 @@ TRAFFIC_STATE_DIR="$DURATION_DIR/traffic_state"
 # 状态文件
 IDLIST="/var/$NAME.idlist"
 STATUS_DB="$DURATION_DIR/status.db"
+LAST_RESET_FILE="/var/run/timecontrol_last_reset_date"
 
 init_dirs() {
     mkdir -p "$DURATION_DIR"
@@ -121,6 +124,7 @@ get_connection_time() {
     fi
 }
 
+# 以下重置检查函数保留用于手动重置，但定时重置不再依赖它们
 should_reset_duration() {
     local target="$1"
     local reset_cycle="$2"
@@ -230,22 +234,80 @@ reset_period_counter() {
     info "重置时段$period 时长: $target (周期: $reset_cycle)"
 }
 
-should_reset_period() {
-    local target="$1"
-    local period="$2"
-    local reset_cycle="$3"
-    local reset_file="$DURATION_DIR/last_reset_${target}_period${period}"
-    [ ! -f "$reset_file" ] && return 0
-    local last_reset=$(cat "$reset_file" 2>/dev/null)
+# ============= 定时重置函数（新增） =============
+perform_scheduled_reset() {
+    dbg "执行定时重置检查..."
     local current_date=$(date +%Y%m%d)
     local current_week=$(date +%Y%W)
     local current_month=$(date +%Y%m)
-    case "$reset_cycle" in
-        "daily")   [ "$last_reset" != "$current_date" ] ;;
-        "weekly")  [ "$last_reset" != "$current_week" ] ;;
-        "monthly") [ "$last_reset" != "$current_month" ] ;;
-        *) false ;;
-    esac
+    
+    # 获取所有设备ID（包括未启用的，确保重置所有配置了周期的设备）
+    local all_ids=$(uci show timecontrol 2>/dev/null | grep "device" | grep -oE '\[[0-9]+\]' | grep -oE '[0-9]+' | sort -n | uniq)
+    if [ -z "$all_ids" ]; then
+        dbg "无设备需要重置"
+        return
+    fi
+    
+    for id in $all_ids; do
+        local target=$(config_t_get device mac "$id")
+        local reset_cycle=$(config_t_get device reset_cycle "$id" "daily")
+        local time_mode=$(config_t_get device time_mode "$id" "period")
+        
+        # 跳过 period 模式（无时长记录）
+        [ "$time_mode" = "period" ] && continue
+        
+        # 根据重置周期判断是否需要重置
+        local need_reset=0
+        case "$reset_cycle" in
+            "daily")
+                # 检查上次重置日期
+                if [ -f "$DURATION_DIR/last_reset_$target" ]; then
+                    last_reset=$(cat "$DURATION_DIR/last_reset_$target" 2>/dev/null)
+                    [ "$last_reset" != "$current_date" ] && need_reset=1
+                else
+                    need_reset=1
+                fi
+                ;;
+            "weekly")
+                if [ -f "$DURATION_DIR/last_reset_$target" ]; then
+                    last_reset=$(cat "$DURATION_DIR/last_reset_$target" 2>/dev/null)
+                    [ "$last_reset" != "$current_week" ] && need_reset=1
+                else
+                    need_reset=1
+                fi
+                ;;
+            "monthly")
+                if [ -f "$DURATION_DIR/last_reset_$target" ]; then
+                    last_reset=$(cat "$DURATION_DIR/last_reset_$target" 2>/dev/null)
+                    [ "$last_reset" != "$current_month" ] && need_reset=1
+                else
+                    need_reset=1
+                fi
+                ;;
+            "never")
+                need_reset=0
+                ;;
+            *)
+                need_reset=0
+                ;;
+        esac
+        
+        if [ "$need_reset" -eq 1 ]; then
+            dbg "定时重置设备: $target (周期: $reset_cycle, 模式: $time_mode)"
+            case "$time_mode" in
+                "duration"|"combined")
+                    reset_duration_counter "$target" "$reset_cycle"
+                    ;;
+                "multi_period")
+                    for p in 1 2 3; do
+                        local start=$(config_t_get device "period${p}_start" "$id" "")
+                        [ -z "$start" ] && continue
+                        reset_period_counter "$target" "$p" "$reset_cycle"
+                    done
+                    ;;
+            esac
+        fi
+    done
 }
 
 # ============= 流量感知配置读取 =============
@@ -264,6 +326,11 @@ read_traffic_config() {
     TRAFFIC_CONSECUTIVE="$(uci -q get timecontrol.timecontrol.traffic_consecutive || echo 3)"
     TRAFFIC_POLL_INTERVAL="$(uci -q get timecontrol.timecontrol.traffic_poll_interval || echo 30)"
     export TRAFFIC_ENABLED TRAFFIC_THRESHOLD_KB TRAFFIC_CONSECUTIVE TRAFFIC_POLL_INTERVAL
+    
+    # 读取定时重置时间（默认01:00）
+    RESET_TIME=$(uci -q get timecontrol.timecontrol.reset_time)
+    [ -z "$RESET_TIME" ] && RESET_TIME="01:00"
+    export RESET_TIME
 }
 
 # ★★★ 获取设备完整数据（MAC 转换使用兼容写法） ★★★
@@ -327,7 +394,7 @@ update_traffic_state() {
     fi
 }
 
-# ============= check_device_control（只判断，不修改状态） =============
+# ============= check_device_control（仅判断，不再执行重置） =============
 check_device_control() {
     local id="$1"
     local target=$(config_t_get device mac "$id")
@@ -352,10 +419,7 @@ check_device_control() {
             ;;
         "duration")
             local duration=$(config_t_get device duration "$id" "60")
-            local reset_cycle=$(config_t_get device reset_cycle "$id" "daily")
-            if should_reset_duration "$target" "$reset_cycle"; then
-                reset_duration_counter "$target" "$reset_cycle"
-            fi
+            # 注意：已移除 should_reset_duration 调用，重置由定时任务处理
             local used_seconds=$(get_connection_time "$target")
             local used_minutes=$((used_seconds / 60))
             local max_minutes=$duration
@@ -377,10 +441,7 @@ check_device_control() {
             }
             if [ "$use_duration" = "1" ]; then
                 local duration=$(config_t_get device duration "$id" "60")
-                local reset_cycle=$(config_t_get device reset_cycle "$id" "daily")
-                if should_reset_duration "$target" "$reset_cycle"; then
-                    reset_duration_counter "$target" "$reset_cycle"
-                fi
+                # 已移除重置调用
                 local used_seconds=$(get_connection_time "$target")
                 local used_minutes=$((used_seconds / 60))
                 local max_minutes=$duration
@@ -394,7 +455,7 @@ check_device_control() {
             return 0
             ;;
         "multi_period")
-            local reset_cycle=$(config_t_get device reset_cycle "$id" "daily")
+            # 已移除重置调用，重置由定时任务处理
             local in_any_period=0
             for p in 1 2 3; do
                 local start=$(config_t_get device "period${p}_start" "$id" "")
@@ -403,9 +464,6 @@ check_device_control() {
                 local dur=$(config_t_get device "period${p}_duration" "$id" "")
                 if is_time_in_range "$start" "$end"; then
                     in_any_period=1
-                    if should_reset_period "$target" "$p" "$reset_cycle"; then
-                        reset_period_counter "$target" "$p" "$reset_cycle"
-                    fi
                     local used_seconds=$(get_period_used "$target" "$p")
                     local used_minutes=$((used_seconds / 60))
                     dbg "时段$p 检查: $target 已用=${used_minutes}分钟, 限制=${dur}分钟"
@@ -432,7 +490,7 @@ check_device_control() {
     esac
 }
 
-# ============= update_device_status（只管理防火墙，内部只在阻断时调用非多时段断开） =============
+# ============= update_device_status（保持不变） =============
 update_device_status() {
     local id="$1"
     local should_allow="$2"
@@ -463,13 +521,17 @@ update_device_status() {
     fi
 }
 
-# ============= 主循环 =============
+# ============= 主循环（新增定时重置检查） =============
 main_loop() {
     info "时间控制守护进程启动"
     init_dirs
     read_traffic_config
     info "流量感知: $([ "$TRAFFIC_ENABLED" = "1" ] && echo "启用" || echo "禁用")"
     info "阈值: ${TRAFFIC_THRESHOLD_KB}KB, 连续次数: ${TRAFFIC_CONSECUTIVE}, 轮询间隔: ${TRAFFIC_POLL_INTERVAL}s"
+    info "定时重置时间: $RESET_TIME"
+
+    # 上次重置日期，用于防止重复执行
+    last_reset_date=""
 
     while :; do
         dbg "========== 新一轮检查 =========="
@@ -480,6 +542,28 @@ main_loop() {
             break
         fi
 
+        # ----- 定时重置检查 -----
+        current_hourmin=$(date +%H:%M)
+        current_date=$(date +%Y%m%d)
+        # 读取上次重置日期（如果文件存在）
+        if [ -f "$LAST_RESET_FILE" ]; then
+            last_reset_date=$(cat "$LAST_RESET_FILE" 2>/dev/null)
+        else
+            last_reset_date=""
+        fi
+        # 判断是否到达重置时间且今天尚未重置
+        # 比较当前时间与 RESET_TIME（字符串比较，注意格式 HH:MM）
+        # 若当前时间 >= RESET_TIME，且 last_reset_date != current_date，则执行重置
+        if [ "$current_hourmin" \> "$RESET_TIME" ] || [ "$current_hourmin" = "$RESET_TIME" ]; then
+            if [ "$last_reset_date" != "$current_date" ]; then
+                info "到达定时重置时间 ($RESET_TIME)，执行重置"
+                perform_scheduled_reset
+                echo "$current_date" > "$LAST_RESET_FILE"
+                dbg "重置已完成，记录日期 $current_date"
+            fi
+        fi
+
+        # ----- 处理设备 -----
         for id in $(get_enabled_devices); do
             local target=$(config_t_get device mac "$id")
             local time_mode=$(config_t_get device time_mode "$id" "period")
@@ -489,7 +573,13 @@ main_loop() {
             local allow=0
             check_device_control "$id"
             allow=$?
-            dbg "允许上网: $([ "$allow" -eq 0 ] && echo "是" || echo "否")"
+            # 获取设备备注（用于日志）
+            local comment=$(config_t_get device comment "$id" "设备$id")
+            if [ "$allow" -eq 0 ]; then
+                dbg "允许上网: $comment ($target)"
+            else
+                dbg "阻止上网: $comment ($target)"
+            fi
 
             # 2. 更新防火墙规则（阻断时会自动断开总时长）
             update_device_status "$id" "$allow"
